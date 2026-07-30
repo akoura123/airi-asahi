@@ -1343,12 +1343,7 @@ pages:
         description: vllm.ai
         title: vLLM
       volcengine:
-        description: volcengine.com
-        fields:
-          field:
-            appId:
-              description: 可在控制台获取的 App ID
-              label: App ID
+        description: 火山引擎 Seed-TTS 2.0（V3）
         title: 火山引擎
       volcengine-coding-plan:
         description: 火山引擎 Coding Plan

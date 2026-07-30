@@ -12,7 +12,7 @@ import messages from '@proj-airi/i18n/locales'
 import { electronApp, optimizer } from '@electron-toolkit/utils'
 import { Format, LogLevel, setGlobalFormat, setGlobalHookPostLog, setGlobalLogLevel, useLogg } from '@guiiai/logg'
 import { createContext } from '@moeru/eventa/adapters/electron/main'
-import { initScreenCaptureForMain } from '@proj-airi/electron-screen-capture/main'
+import { hasPendingDisplayMediaRequest, initScreenCaptureForMain } from '@proj-airi/electron-screen-capture/main'
 import { app, ipcMain, session } from 'electron'
 import { noop } from 'es-toolkit'
 import { createLoggLogger, injeca, lifecycle } from 'injeca'
@@ -38,6 +38,8 @@ import { setupArtistryBridge } from './services/airi/widgets/artistry-bridge'
 import { setupAutoUpdater } from './services/electron/auto-updater'
 import { setupGlobalShortcutService } from './services/electron/global-shortcut'
 import { setupMediaPermissionHandlers } from './services/electron/media-permissions'
+import { setupMeetingMediaService } from './services/electron/meeting-media'
+import { createMeetingMediaPlatformProbe } from './services/electron/meeting-media/platform'
 import { setupTray } from './tray'
 import { setupAboutWindowReusable } from './windows/about'
 import { setupBeatSync } from './windows/beat-sync'
@@ -115,7 +117,7 @@ app.whenReady().then(async () => {
     return
   }
 
-  setupMediaPermissionHandlers(session.defaultSession)
+  setupMediaPermissionHandlers(session.defaultSession, hasPendingDisplayMediaRequest)
 
   // Initialize file logger and register the hook
   fileLogger = await setupFileLogger()
@@ -182,6 +184,15 @@ app.whenReady().then(async () => {
 
   const globalShortcut = injeca.provide('services:global-shortcut', () => setupGlobalShortcutService())
 
+  const meetingMediaPlatformProbe = injeca.provide(
+    'services:meeting-media-platform-probe',
+    () => createMeetingMediaPlatformProbe(),
+  )
+  const meetingMedia = injeca.provide('services:meeting-media', {
+    dependsOn: { platformProbe: meetingMediaPlatformProbe },
+    build: ({ dependsOn }) => setupMeetingMediaService(dependsOn),
+  })
+
   // BeatSync will create a background window to capture and process audio.
   const beatSync = injeca.provide('windows:beat-sync', () => setupBeatSync())
 
@@ -213,7 +224,7 @@ app.whenReady().then(async () => {
   })
 
   const settingsWindow = injeca.provide('windows:settings', {
-    dependsOn: { widgetsManager, beatSync, autoUpdater, devtoolsWindow: devtoolsMarkdownStressWindow, serverChannel, godotStageManager, mcpStdioManager, i18n, windowAuthManager, globalShortcut, spotlightWindow },
+    dependsOn: { widgetsManager, beatSync, autoUpdater, devtoolsWindow: devtoolsMarkdownStressWindow, serverChannel, godotStageManager, mcpStdioManager, i18n, windowAuthManager, globalShortcut, spotlightWindow, meetingMedia },
     build: async ({ dependsOn }) =>
       setupSettingsWindowReusableFunc({
         ...dependsOn,
@@ -222,7 +233,7 @@ app.whenReady().then(async () => {
   })
 
   const mainWindow = injeca.provide('windows:main', {
-    dependsOn: { settingsWindow, chatWindow, widgetsManager, noticeWindow, beatSync, autoUpdater, serverChannel, godotStageManager, mcpStdioManager, i18n, onboardingWindowManager, windowAuthManager },
+    dependsOn: { settingsWindow, chatWindow, widgetsManager, noticeWindow, beatSync, autoUpdater, serverChannel, godotStageManager, mcpStdioManager, i18n, onboardingWindowManager, windowAuthManager, meetingMedia },
     build: async ({ dependsOn }) => setupMainWindow({
       ...dependsOn,
       onWindowCreated: (window) => {

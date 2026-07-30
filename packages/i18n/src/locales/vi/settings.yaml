@@ -1343,12 +1343,7 @@ pages:
         description: vllm.ai
         title: vLLM
       volcengine:
-        description: volcengine.com
-        fields:
-          field:
-            appId:
-              description: App ID của dự án (lấy trong Console)
-              label: App ID
+        description: Volcengine Seed-TTS 2.0 (V3)
         title: Volcano Engine
       volcengine-coding-plan:
         description: Volcengine Coding Plan

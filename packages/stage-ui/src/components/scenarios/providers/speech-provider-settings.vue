@@ -27,7 +27,7 @@ const props = defineProps<{
 }>()
 
 // Expose slots and emit events to allow customization
-defineSlots<{
+const slots = defineSlots<{
   'basic-settings': (props: any) => any
   'voice-settings': (props: any) => any
   'advanced-settings': (props: any) => any
@@ -41,6 +41,9 @@ const { providers } = storeToRefs(providersStore)
 
 // Get provider metadata
 const providerMetadata = computed(() => providersStore.getProviderMetadata(props.providerId))
+const showsAdvancedSettings = computed(() => {
+  return providerMetadata.value?.baseUrlConfigurable !== false || slots['advanced-settings'] != null
+})
 
 // Common provider settings
 const apiKey = computed({
@@ -152,8 +155,12 @@ function handleResetVoiceSettings() {
         </div>
 
         <!-- Advanced settings section -->
-        <ProviderAdvancedSettings :title="t('settings.pages.providers.common.section.advanced.title')">
+        <ProviderAdvancedSettings
+          v-if="showsAdvancedSettings"
+          :title="t('settings.pages.providers.common.section.advanced.title')"
+        >
           <ProviderBaseUrlInput
+            v-if="providerMetadata?.baseUrlConfigurable !== false"
             v-model="baseUrl"
             :placeholder="providerMetadata?.defaultOptions?.().baseUrl as string || ''" required
           />

@@ -15,6 +15,7 @@ import { useModsServerChannelStore } from '@proj-airi/stage-ui/stores/mods/api/c
 import { useContextBridgeStore } from '@proj-airi/stage-ui/stores/mods/api/context-bridge'
 import { useAiriCardStore } from '@proj-airi/stage-ui/stores/modules/airi-card'
 import { useArtistryStore } from '@proj-airi/stage-ui/stores/modules/artistry'
+import { useMeetingMediaStore } from '@proj-airi/stage-ui/stores/modules/meeting-media'
 import { usePerfTracerBridgeStore } from '@proj-airi/stage-ui/stores/perf-tracer-bridge'
 import { listProvidersForPluginHost, shouldPublishPluginHostCapabilities } from '@proj-airi/stage-ui/stores/plugin-host-capabilities'
 import { useSettings, useSettingsAudioDevice } from '@proj-airi/stage-ui/stores/settings'
@@ -30,6 +31,10 @@ import {
   electronGetServerChannelConfig,
   electronGodotStageGetStatus,
   electronGodotStageStatusChanged,
+  electronMeetingMediaRendererMetrics,
+  electronMeetingMediaRendererRouteFailed,
+  electronMeetingMediaRendererStart,
+  electronMeetingMediaRendererStop,
   electronSettingsNavigate,
   electronStartTrackMousePosition,
   i18nGetLocale,
@@ -51,8 +56,10 @@ import {
 } from '../shared/eventa/plugin/host'
 import { electronPluginToolsChanged } from '../shared/eventa/plugin/tools'
 import { initializeElectronAuthCallbackBridge } from './bridges/electron-auth-callback'
+import { createMeetingMediaEventaControl } from './bridges/meeting-media'
 import { initializeStageThreeRuntimeTraceBridge } from './bridges/stage-three-runtime-trace'
 import { useLanguage } from './composables/use-language'
+import { createMeetingMediaRendererHost } from './services/meeting-media-host'
 import { createChatSyncWindowLifecycle, resolveInitialChatSyncRoutePath } from './stores/chat-sync-lifecycle'
 import { useTamagotchiMcpToolsStore } from './stores/mcp-tools'
 import { useTamagotchiPluginToolsStore } from './stores/plugin-tools'
@@ -91,6 +98,7 @@ function createFullStageRuntime() {
   const stageWindowLifecycleStore = useStageWindowLifecycleStore()
   const settingsAudioDeviceStore = useSettingsAudioDevice()
   const artistryStore = useArtistryStore()
+  const meetingMediaStore = useMeetingMediaStore()
   const { activeProvider, artistryGlobals, activeModel, defaultPromptPrefix, providerOptions } = storeToRefs(artistryStore)
   const getServerChannelConfig = useElectronEventaInvoke(electronGetServerChannelConfig)
   const listPlugins = useElectronEventaInvoke(electronPluginList)
@@ -105,8 +113,22 @@ function createFullStageRuntime() {
   const getGodotStageStatus = useElectronEventaInvoke(electronGodotStageGetStatus)
   const syncArtistryConfig = useElectronEventaInvoke(artistrySyncConfig)
   const isAuxiliaryChatRoute = initialWindowRoutePath === '/chat'
+  const isMeetingMediaHostRoute = initialWindowRoutePath === '/'
   const isGodotStageRoute = () => route.path === '/' || route.path.startsWith('/settings')
+  const isMeetingMediaRoute = () => route.path === '/' || route.path.startsWith('/settings')
   const isWidgetsWindowRoute = () => route.path === '/widgets'
+  const meetingMediaRendererHost = isMeetingMediaHostRoute
+    ? createMeetingMediaRendererHost({
+        reportRouteFailure: error => context.value.emit(electronMeetingMediaRendererRouteFailed, error),
+        reportMetrics: update => context.value.emit(electronMeetingMediaRendererMetrics, update),
+      })
+    : null
+  const meetingMediaRendererHostCleanups = meetingMediaRendererHost
+    ? [
+        defineInvokeHandler(context.value, electronMeetingMediaRendererStart, payload => meetingMediaRendererHost.start(payload.sessionId, payload.profile)),
+        defineInvokeHandler(context.value, electronMeetingMediaRendererStop, payload => meetingMediaRendererHost.stop(payload.sessionId)),
+      ]
+    : []
 
   function syncGodotStageRenderer(state: { state: 'stopped' | 'starting' | 'running' | 'stopping' | 'error' }) {
     if (state.state === 'running') {
@@ -204,6 +226,9 @@ function createFullStageRuntime() {
       await settingsStore.initializeStageModel()
       await settingsAudioDeviceStore.initialize()
 
+      if (isMeetingMediaRoute())
+        await meetingMediaStore.connect(createMeetingMediaEventaControl())
+
       if (isGodotStageRoute()) {
         try {
           syncGodotStageRenderer(await getGodotStageStatus())
@@ -245,10 +270,15 @@ function createFullStageRuntime() {
       inferencePreload.triggerPreload()
     },
     dispose() {
+      for (const cleanup of meetingMediaRendererHostCleanups)
+        cleanup()
+      if (meetingMediaRendererHost && meetingMediaStore.runtime.sessionId)
+        void meetingMediaRendererHost.stop(meetingMediaStore.runtime.sessionId)
       if (!isAuxiliaryChatRoute)
         contextBridgeStore.dispose()
       mcpToolsStore.dispose()
       pluginToolsStore.dispose()
+      meetingMediaStore.disconnect()
     },
   }
 }

@@ -6,6 +6,7 @@ import type { ServerChannel } from '../../../services/airi/channel-server'
 import type { GodotStageManager } from '../../../services/airi/godot-stage'
 import type { McpStdioManager } from '../../../services/airi/mcp-servers'
 import type { AutoUpdater } from '../../../services/electron/auto-updater'
+import type { MeetingMediaService } from '../../../services/electron/meeting-media'
 import type { NoticeWindowManager } from '../../notice'
 import type { OnboardingWindowManager } from '../../onboarding'
 import type { SettingsWindowManager } from '../../settings'
@@ -39,6 +40,7 @@ export async function setupMainWindowElectronInvokes(params: {
   i18n: I18n
   onboardingWindowManager: OnboardingWindowManager
   windowAuthManager: WindowAuthManager
+  meetingMedia: MeetingMediaService
 }) {
   // TODO: once we refactored eventa to support window-namespaced contexts,
   // we can remove the setMaxListeners call below since eventa will be able to dispatch and
@@ -54,6 +56,7 @@ export async function setupMainWindowElectronInvokes(params: {
   createGodotStageService({ context, manager: params.godotStageManager, window: params.window })
   createOnboardingService({ context, onboardingWindowManager: params.onboardingWindowManager, mainWindow: params.window })
   createAuthService({ context, window: params.window, windowAuthManager: params.windowAuthManager })
+  params.meetingMedia.registerWindow({ context, window: params.window, mediaHost: true })
 
   defineInvokeHandler(context, electronCenterMainWindow, () => centerWindowOnDisplay(params.window))
   defineInvokeHandler(context, electronOpenMainDevtools, () => params.window.webContents.openDevTools({ mode: 'detach' }))

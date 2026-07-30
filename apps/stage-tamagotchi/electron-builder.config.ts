@@ -213,6 +213,11 @@ export default {
       {
         NSCameraUsageDescription: 'AIRI requires camera access for vision understanding',
       },
+      {
+        // Electron 41 uses macOS CoreAudio Tap for desktop audio capture. Without this key,
+        // Chromium can return a live-looking MediaStream whose audio track remains silent.
+        NSAudioCaptureUsageDescription: 'AIRI requires system audio access to process meeting speech',
+      },
     ],
     // For self-publishing, testing, and distribution after modified the code without access to
     // an Apple Developer account, comment and uncomment the following 4 lines.

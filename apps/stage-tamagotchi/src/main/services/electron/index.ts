@@ -1,6 +1,7 @@
 export * from './app'
 export * from './auto-updater'
 export * from './global-shortcut'
+export * from './meeting-media'
 export * from './powerMonitor'
 export * from './screen'
 export * from './system-preferences'

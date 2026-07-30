@@ -1,0 +1,348 @@
+import type {
+  MeetingMediaSpeechEvent,
+  MeetingMediaSpeechProfile,
+  MeetingMediaTranscriptEvent,
+} from '@proj-airi/stage-shared/meeting-media'
+
+import type { HearingStreamingTranscriptionSession } from '../stores/modules/hearing'
+
+import { toWav } from '@proj-airi/audio/encoding'
+import { joinTranscriptFragments } from '@proj-airi/pipelines-audio'
+import { storeToRefs } from 'pinia'
+import { shallowRef } from 'vue'
+
+import vadWorkletUrl from '../workers/vad/process.worklet?worker&url'
+
+import { useVAD } from '../stores/ai/models/vad'
+import { resolveActiveTranscriptionModel, useHearingSpeechInputPipeline, useHearingStore } from '../stores/modules/hearing'
+import { useProvidersStore } from '../stores/providers'
+import { MeetingTurnAssembler } from './meeting-speech'
+
+interface ActiveMeetingSpeechSegment {
+  id: string
+  capturedAtMs: number
+  partialText: string
+  streamingSession: Promise<HearingStreamingTranscriptionSession> | null
+  batchAbortController?: AbortController
+}
+
+interface ActiveMeetingSpeechSession {
+  sessionId: string
+  stream: MediaStream
+  profile: MeetingMediaSpeechProfile
+  assembler: MeetingTurnAssembler
+  capturingSegment: ActiveMeetingSpeechSegment | null
+  pendingSegments: Map<string, ActiveMeetingSpeechSegment>
+  batchSegmentAwaitingAudio: ActiveMeetingSpeechSegment | null
+  speechSequence: number
+  transcriptSequence: number
+  generation: number
+  failed: boolean
+}
+
+export interface MeetingSpeechSessionOptions {
+  onPartial?: (event: Extract<MeetingMediaTranscriptEvent, { type: 'partial' }>) => void
+  onTurnEnd: (event: Extract<MeetingMediaTranscriptEvent, { type: 'turn-end' }>) => void | Promise<void>
+  onFailure: (error: Error) => void
+}
+
+function normalizedError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
+}
+
+/**
+ * Creates the VAD-authoritative meeting ASR lifecycle used by a renderer media host.
+ * Batch and streaming providers share the same segment correlation and turn-end boundary.
+ */
+export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
+  const hearingStore = useHearingStore()
+  const hearingPipeline = useHearingSpeechInputPipeline()
+  const providersStore = useProvidersStore()
+  const { activeTranscriptionModel, activeTranscriptionProvider } = storeToRefs(hearingStore)
+  const { error: hearingError, supportsStreamInput } = storeToRefs(hearingPipeline)
+
+  const vadThreshold = shallowRef(0.52)
+  const vadMinSilenceDurationMs = shallowRef(1200)
+  const vadSpeechPadMs = shallowRef(360)
+  const vadMinSpeechDurationMs = shallowRef(300)
+
+  let active: ActiveMeetingSpeechSession | null = null
+  let generation = 0
+  let finalization = Promise.resolve()
+
+  function reportFailure(error: unknown): void {
+    const session = active
+    if (!session || session.failed)
+      return
+    session.failed = true
+    options.onFailure(normalizedError(error))
+  }
+
+  function deliverOutcome(outcome: ReturnType<MeetingTurnAssembler['acceptSpeech']>): void {
+    if (outcome.status !== 'turn-end')
+      return
+    void Promise.resolve(options.onTurnEnd(outcome.event)).catch(reportFailure)
+  }
+
+  function acceptPartial(session: ActiveMeetingSpeechSession, segment: ActiveMeetingSpeechSegment, delta: string): void {
+    const text = delta.trim()
+    if (!text
+      || active?.generation !== session.generation
+      || session.pendingSegments.get(segment.id) !== segment) {
+      return
+    }
+
+    segment.partialText = joinTranscriptFragments(segment.partialText, text)
+    const event: Extract<MeetingMediaTranscriptEvent, { type: 'partial' }> = {
+      type: 'partial',
+      sessionId: session.sessionId,
+      segmentId: segment.id,
+      sequence: ++session.transcriptSequence,
+      capturedAtMs: segment.capturedAtMs,
+      text: segment.partialText,
+    }
+    session.assembler.acceptTranscript(event)
+    options.onPartial?.(event)
+  }
+
+  async function beginSegment(): Promise<void> {
+    const session = active
+    if (!session || session.failed)
+      return
+    if (session.capturingSegment) {
+      reportFailure(new Error('VAD started a new speech segment before the previous segment finished.'))
+      return
+    }
+
+    const segment: ActiveMeetingSpeechSegment = {
+      id: crypto.randomUUID(),
+      capturedAtMs: Date.now(),
+      partialText: '',
+      streamingSession: null,
+    }
+    const speechStart: MeetingMediaSpeechEvent = {
+      type: 'speech-start',
+      sessionId: session.sessionId,
+      segmentId: segment.id,
+      sequence: ++session.speechSequence,
+      capturedAtMs: segment.capturedAtMs,
+    }
+    session.assembler.acceptSpeech(speechStart)
+    session.capturingSegment = segment
+    session.pendingSegments.set(segment.id, segment)
+
+    if (session.profile.mode !== 'streaming')
+      return
+    if (!supportsStreamInput.value) {
+      reportFailure(new Error('The selected transcription provider does not support streaming input.'))
+      return
+    }
+
+    segment.streamingSession = hearingPipeline.transcribeForMediaStream(session.stream, {
+      idleTimeoutMs: 0,
+      providerOptions: { language: session.profile.locale },
+      onSentenceEnd: delta => acceptPartial(session, segment, delta),
+    }).then((streamingSession) => {
+      if (!streamingSession)
+        throw new Error(hearingError.value || 'The streaming transcription provider did not start a session.')
+      return streamingSession
+    })
+    await segment.streamingSession
+  }
+
+  function enqueueFinalTranscript(
+    session: ActiveMeetingSpeechSession,
+    segment: ActiveMeetingSpeechSegment,
+    transcription: Promise<string | undefined>,
+    emptyResultMessage: string,
+  ): void {
+    const settledTranscription = transcription.then(
+      text => ({ text } as const),
+      error => ({ error } as const),
+    )
+
+    finalization = finalization.then(async () => {
+      const result = await settledTranscription
+      if ('error' in result)
+        throw result.error
+      if (active?.generation !== session.generation
+        || session.pendingSegments.get(segment.id) !== segment) {
+        return
+      }
+      const { text } = result
+      if (typeof text !== 'string')
+        throw new Error(hearingError.value || emptyResultMessage)
+
+      const outcome = session.assembler.acceptTranscript({
+        type: 'final',
+        sessionId: session.sessionId,
+        segmentId: segment.id,
+        sequence: ++session.transcriptSequence,
+        capturedAtMs: segment.capturedAtMs,
+        text,
+      })
+      session.pendingSegments.delete(segment.id)
+      deliverOutcome(outcome)
+    }).catch(reportFailure)
+  }
+
+  function finishStreamingSegment(session: ActiveMeetingSpeechSession, segment: ActiveMeetingSpeechSegment): void {
+    const streamingSession = segment.streamingSession
+    if (!streamingSession) {
+      reportFailure(new Error('The streaming speech segment ended before its transcription session started.'))
+      return
+    }
+
+    // Start transport finalization immediately. Only transcript delivery is ordered;
+    // the next VAD segment does not wait for this provider response.
+    enqueueFinalTranscript(
+      session,
+      segment,
+      streamingSession.then(handle => handle.finish(false)),
+      'The streaming transcription provider returned no final transcript.',
+    )
+  }
+
+  function endSegment(): void {
+    const session = active
+    const segment = session?.capturingSegment
+    if (!session || !segment || session.failed)
+      return
+
+    const outcome = session.assembler.acceptSpeech({
+      type: 'speech-end',
+      sessionId: session.sessionId,
+      segmentId: segment.id,
+      sequence: ++session.speechSequence,
+      capturedAtMs: segment.capturedAtMs,
+      endedAtMs: Date.now(),
+    })
+    deliverOutcome(outcome)
+    session.capturingSegment = null
+
+    if (session.profile.mode === 'streaming') {
+      finishStreamingSegment(session, segment)
+      return
+    }
+
+    if (session.batchSegmentAwaitingAudio) {
+      reportFailure(new Error('VAD produced overlapping batch speech buffers.'))
+      return
+    }
+    session.batchSegmentAwaitingAudio = segment
+  }
+
+  function transcribeBatch(buffer: Float32Array): void {
+    const session = active
+    const segment = session?.batchSegmentAwaitingAudio
+    if (!session || !segment || session.failed || session.profile.mode !== 'batch')
+      return
+    session.batchSegmentAwaitingAudio = null
+
+    const abortController = new AbortController()
+    segment.batchAbortController = abortController
+    const transcription = (async () => {
+      const wav = toWav(buffer.slice().buffer, 16000)
+      return hearingPipeline.transcribeForRecording(
+        new Blob([wav], { type: 'audio/wav' }),
+        {
+          providerOptions: {
+            abortSignal: abortController.signal,
+            language: session.profile.locale,
+          },
+        },
+      )
+    })()
+    enqueueFinalTranscript(
+      session,
+      segment,
+      transcription,
+      'The batch transcription provider returned no final transcript.',
+    )
+  }
+
+  const vad = useVAD(vadWorkletUrl, {
+    threshold: vadThreshold,
+    minSilenceDurationMs: vadMinSilenceDurationMs,
+    speechPadMs: vadSpeechPadMs,
+    minSpeechDurationMs: vadMinSpeechDurationMs,
+    onSpeechStart: () => void beginSegment().catch(reportFailure),
+    onSpeechEnd: endSegment,
+    onSpeechReady: event => transcribeBatch(event.buffer),
+  })
+
+  async function start(params: {
+    sessionId: string
+    stream: MediaStream
+    profile: MeetingMediaSpeechProfile
+  }): Promise<void> {
+    if (active)
+      throw new Error(`Meeting speech input is already owned by session "${active.sessionId}".`)
+    const activeModel = resolveActiveTranscriptionModel(
+      activeTranscriptionModel.value,
+      providersStore.getProviderConfig(activeTranscriptionProvider.value),
+    )
+    if (activeTranscriptionProvider.value !== params.profile.providerId
+      || activeModel !== params.profile.model) {
+      throw new Error('The meeting ASR profile must match the currently active transcription provider and model.')
+    }
+
+    vadThreshold.value = params.profile.vad.threshold
+    vadMinSilenceDurationMs.value = params.profile.vad.minSilenceDurationMs
+    vadSpeechPadMs.value = params.profile.vad.speechPadMs
+    vadMinSpeechDurationMs.value = params.profile.vad.minSpeechDurationMs
+
+    const sessionGeneration = ++generation
+    active = {
+      sessionId: params.sessionId,
+      stream: params.stream,
+      profile: structuredClone(params.profile),
+      assembler: new MeetingTurnAssembler({
+        sessionId: params.sessionId,
+        maxPendingSegments: 2,
+        maxCompletedSegmentIds: 128,
+      }),
+      capturingSegment: null,
+      pendingSegments: new Map(),
+      batchSegmentAwaitingAudio: null,
+      speechSequence: 0,
+      transcriptSequence: 0,
+      generation: sessionGeneration,
+      failed: false,
+    }
+
+    await vad.init()
+    if (!vad.loaded.value)
+      throw new Error(vad.inferenceError.value || 'The meeting VAD model could not be initialized.')
+    await vad.start(params.stream)
+  }
+
+  async function stop(sessionId: string): Promise<void> {
+    const session = active
+    if (!session || session.sessionId !== sessionId)
+      return
+
+    generation += 1
+    active = null
+    session.assembler.stop()
+    vad.dispose()
+
+    const abortReason = new DOMException('Aborted', 'AbortError')
+    const cancellations: Promise<unknown>[] = []
+    for (const segment of session.pendingSegments.values()) {
+      segment.batchAbortController?.abort(abortReason)
+      if (segment.streamingSession) {
+        cancellations.push(
+          segment.streamingSession
+            .then(streamingSession => streamingSession.finish(true))
+            .catch(() => undefined),
+        )
+      }
+    }
+    await Promise.all(cancellations)
+    await finalization
+    finalization = Promise.resolve()
+  }
+
+  return { start, stop }
+}

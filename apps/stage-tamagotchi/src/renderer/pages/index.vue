@@ -23,13 +23,15 @@ import {
 import { WidgetStage } from '@proj-airi/stage-ui/components/scenes'
 import { useVoiceInputSession } from '@proj-airi/stage-ui/composables'
 import { useCanvasPixelIsTransparentAtPoint } from '@proj-airi/stage-ui/composables/canvas-alpha'
+import { registerMeetingVideoOutputSurface } from '@proj-airi/stage-ui/services/meeting-video'
 import { useSpeakingStore } from '@proj-airi/stage-ui/stores/audio'
 import { useHearingSpeechInputPipeline, useHearingStore } from '@proj-airi/stage-ui/stores/modules/hearing'
+import { useMeetingMediaStore } from '@proj-airi/stage-ui/stores/modules/meeting-media'
 import { useOnboardingStore } from '@proj-airi/stage-ui/stores/onboarding'
 import { useSettings, useSettingsAudioDevice } from '@proj-airi/stage-ui/stores/settings'
 import { refDebounced, useBroadcastChannel } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
-import { computed, onMounted, onUnmounted, ref, shallowRef, toRef, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, shallowRef, toRef, useTemplateRef, watch } from 'vue'
 import { toast } from 'vue-sonner'
 
 import ControlsIsland from '../components/stage-islands/controls-island/index.vue'
@@ -38,6 +40,7 @@ import StatusIsland from '../components/stage-islands/status-island/index.vue'
 
 import { electronOpenOnboarding } from '../../shared/eventa'
 import { modelSettingsRuntimeSnapshotChannelName } from '../../shared/model-settings-runtime'
+import { registerMeetingSpeechInputController } from '../services/meeting-speech-input-controller'
 import { useChatSyncStore } from '../stores/chat-sync'
 import { useControlsIslandStore } from '../stores/controls-island'
 import { useStageWindowLifecycleStore } from '../stores/stage-window-lifecycle'
@@ -52,6 +55,7 @@ import {
 const controlsIslandRef = ref<InstanceType<typeof ControlsIsland>>()
 const statusIslandRef = ref<InstanceType<typeof StatusIsland>>()
 const widgetStageRef = ref<InstanceType<typeof WidgetStage>>()
+const meetingMediaOutputCanvas = useTemplateRef<HTMLCanvasElement>('meetingMediaOutputCanvas')
 const stageCanvas = toRef(() => widgetStageRef.value?.canvasElement())
 const componentStateStage = ref<'pending' | 'loading' | 'mounted'>('pending')
 const stageMounted = computed(() => componentStateStage.value === 'mounted')
@@ -96,12 +100,24 @@ const isTransparentByThreeExact = useThreeSceneIsTransparentAtPoint(
 )
 
 const settingsStore = useSettings()
+const meetingMediaStore = useMeetingMediaStore()
+const { runtime: meetingMediaRuntime } = storeToRefs(meetingMediaStore)
 const { stageModelRenderer, stageModelSelectedUrl } = storeToRefs(settingsStore)
 const modelStore = useModelStore()
 const { sceneMutationLocked, scenePhase } = storeToRefs(modelStore)
 const { stagePaused } = storeToRefs(useStageWindowLifecycleStore())
 const { fadeOnHoverEnabled } = storeToRefs(useControlsIslandStore())
 const modelSettingsRuntimeOwnerInstanceId = `tamagotchi-main-stage:${Math.random().toString(36).slice(2, 10)}`
+const meetingMediaOutputOwnerId = `tamagotchi-meeting-output:${Math.random().toString(36).slice(2, 10)}`
+let disposeMeetingMediaOutputSurface: (() => void) | undefined
+const meetingMediaOutputActive = computed(() => (
+  meetingMediaRuntime.value.activeProfile?.backend === 'compatibility'
+  && meetingMediaRuntime.value.activeProfile.video.enabled
+  && (meetingMediaRuntime.value.state === 'starting' || meetingMediaRuntime.value.state === 'running')
+))
+const stageSurfaceOpacityClass = computed(() => (
+  meetingMediaOutputActive.value || shouldFadeOnCursorWithin.value ? 'op-0' : 'op-100'
+))
 const { data: modelSettingsRuntimeChannelEvent, post: postModelSettingsRuntimeChannelEvent } = useBroadcastChannel<ModelSettingsRuntimeChannelEvent, ModelSettingsRuntimeChannelEvent>({ name: modelSettingsRuntimeSnapshotChannelName })
 const shouldUseThreeTransparencyHitTest = computed(() => shouldSampleStageTransparency({
   componentState: componentStateStage.value,
@@ -323,6 +339,7 @@ const voiceTranscriptBuffer = createTranscriptBuffer({
 
 const assistantSpeechSuppressedUntil = shallowRef(0)
 const assistantSpeechResumeTimer = shallowRef<ReturnType<typeof setTimeout>>()
+const meetingSpeechInputReserved = ref(false)
 let voiceInputGeneration = 0
 
 /** Controls transcript cleanup while voice input stops. */
@@ -334,6 +351,19 @@ interface StopAudioInteractionOptions {
 const voiceInputInteractionLifecycle = createVoiceInputInteractionLifecycle<StopAudioInteractionOptions>({
   start: startAudioInteractionConsumers,
   stop: stopAudioInteractionConsumers,
+})
+const disposeMeetingSpeechInputController = registerMeetingSpeechInputController({
+  ownerId: `main-stage-voice-input:${crypto.randomUUID()}`,
+  async suspendForMeeting() {
+    meetingSpeechInputReserved.value = true
+    clearAssistantSpeechResumeTimer()
+    await voiceInputInteractionLifecycle.stop({ flushTranscript: false })
+  },
+  async resumeAfterMeeting() {
+    meetingSpeechInputReserved.value = false
+    if (enabled.value && !isVoiceInputSuppressed())
+      await voiceInputInteractionLifecycle.start()
+  },
 })
 
 // Caption overlay broadcast channel
@@ -358,7 +388,7 @@ function reportVoiceInputFailure(action: string, error: unknown) {
  * Checks whether current voice input should be ignored to avoid assistant self-transcription.
  */
 function isVoiceInputSuppressed(now = Date.now()) {
-  return shouldSuppressVoiceInput({
+  return meetingSpeechInputReserved.value || shouldSuppressVoiceInput({
     assistantSpeaking: nowSpeaking.value,
     suppressedUntil: assistantSpeechSuppressedUntil.value,
   }, now)
@@ -656,12 +686,22 @@ watch(nowSpeaking, async (speaking) => {
 })
 
 onMounted(() => {
+  if (meetingMediaOutputCanvas.value) {
+    disposeMeetingMediaOutputSurface = registerMeetingVideoOutputSurface({
+      ownerId: meetingMediaOutputOwnerId,
+      canvas: meetingMediaOutputCanvas.value,
+    })
+  }
+
   if (onboardingStore.needsOnboarding) {
     openOnboarding()
   }
 })
 
 onUnmounted(() => {
+  disposeMeetingSpeechInputController()
+  disposeMeetingMediaOutputSurface?.()
+  disposeMeetingMediaOutputSurface = undefined
   postModelSettingsRuntimeEvent({
     type: 'owner-gone',
     ownerInstanceId: modelSettingsRuntimeOwnerInstanceId,
@@ -698,10 +738,11 @@ const cursorPosition = computed(() => ({
 
 <template>
   <div
+    :class="[meetingMediaOutputActive ? 'rounded-none bg-black' : 'rounded-xl']"
     max-h="[100vh]"
     max-w="[100vw]"
     flex="~ col"
-    relative z-2 h-full overflow-hidden rounded-xl
+    relative z-2 h-full overflow-hidden
     transition="opacity duration-500 ease-in-out"
   >
     <!-- Stage is always in DOM so TresCanvas can measure dimensions -->
@@ -713,7 +754,7 @@ const cursorPosition = computed(() => ({
     >
       <div
         :class="[
-          shouldFadeOnCursorWithin ? 'op-0' : 'op-100',
+          stageSurfaceOpacityClass,
           'absolute',
           'top-0 left-0 w-full h-full',
           'overflow-hidden',
@@ -726,6 +767,7 @@ const cursorPosition = computed(() => ({
         <WidgetStage
           ref="widgetStageRef"
           v-model:state="componentStateStage"
+          meeting-media-source
           h-full w-full
           flex-1
           :cursor-position="cursorPosition"
@@ -734,9 +776,14 @@ const cursorPosition = computed(() => ({
         <HoloCoupon />
         <ControlsIsland ref="controlsIslandRef" />
       </div>
+      <canvas
+        v-show="meetingMediaOutputActive"
+        ref="meetingMediaOutputCanvas"
+        :class="['pointer-events-none absolute inset-0 z-10 h-full w-full bg-black']"
+      />
     </div>
     <!-- Loading overlay sits on top, does not hide the stage -->
-    <div v-show="isLoading" class="absolute left-0 top-0 z-99 h-full w-full flex cursor-grab items-center justify-center overflow-hidden">
+    <div v-show="isLoading && !meetingMediaOutputActive" class="absolute left-0 top-0 z-99 h-full w-full flex cursor-grab items-center justify-center overflow-hidden">
       <div
         :class="[
           'absolute h-24 w-full overflow-hidden rounded-xl',
@@ -799,7 +846,7 @@ const cursorPosition = computed(() => ({
     leave-from-class="opacity-100"
     leave-to-class="opacity-50"
   >
-    <div v-if="isAroundWindowBorderFor250Ms && !isLoading" class="pointer-events-none absolute left-0 top-0 z-999 h-full w-full">
+    <div v-if="isAroundWindowBorderFor250Ms && !isLoading && !meetingMediaOutputActive" class="pointer-events-none absolute left-0 top-0 z-999 h-full w-full">
       <div
         :class="[
           'b-primary/50',

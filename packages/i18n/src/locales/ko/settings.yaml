@@ -1343,12 +1343,7 @@ pages:
         description: vllm.ai
         title: vLLM
       volcengine:
-        description: volcengine.com
-        fields:
-          field:
-            appId:
-              description: 콘솔에서 얻을 수 있는 프로젝트의 애플리케이션 ID
-              label: 애플리케이션 ID
+        description: Volcengine Seed-TTS 2.0 (V3)
         title: Volcano 엔진
       volcengine-coding-plan:
         description: Volcengine Coding Plan

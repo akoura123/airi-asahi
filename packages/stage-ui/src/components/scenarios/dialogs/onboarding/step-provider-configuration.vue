@@ -83,6 +83,10 @@ const needsBaseUrl = computed(() => {
   // Providers with custom onboarding fields handle their own endpoints
   if (hasOnboardingFields.value)
     return false
+  // Fixed-protocol adapters own their upstream endpoint and must not accept a
+  // user-provided URL from onboarding.
+  if (props.selectedProvider.baseUrlConfigurable === false)
+    return false
   return props.selectedProvider.id !== 'cloudflare-workers-ai'
 })
 

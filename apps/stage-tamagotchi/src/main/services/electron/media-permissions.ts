@@ -11,6 +11,9 @@ type LocalAppWebContents = Pick<WebContents, 'getURL'>
 const LOCAL_APP_PERMISSION_NAMES = new Set<ElectronPermission>([
   'display-capture',
   'clipboard-sanitized-write',
+  // The meeting bridge needs this Chromium permission to enumerate BlackHole and
+  // route AIRI speech to that exact audio output. It does not grant media capture.
+  'speaker-selection',
 ])
 
 /**
@@ -20,18 +23,37 @@ function isUsableRequesterURL(rawURL: string | undefined): rawURL is string {
   return !!rawURL && rawURL !== 'null'
 }
 
-/**
- * Checks whether Electron described an audio-only media permission operation.
- */
-function isAudioMediaPermission(permission: ElectronPermission, details?: ElectronPermissionDetails): boolean {
+/** Checks whether Electron described a single-purpose media capture operation. */
+function isSingleMediaPermission(
+  permission: ElectronPermission,
+  expectedType: 'audio' | 'video',
+  details?: ElectronPermissionDetails,
+): boolean {
   if (permission !== 'media' || !details)
     return false
 
   if ('mediaTypes' in details && details.mediaTypes?.length) {
-    return details.mediaTypes.includes('audio') && !details.mediaTypes.includes('video')
+    return details.mediaTypes.length === 1 && details.mediaTypes[0] === expectedType
   }
 
-  return 'mediaType' in details && details.mediaType === 'audio'
+  return 'mediaType' in details && details.mediaType === expectedType
+}
+
+/** Checks whether Electron omitted a media type from an otherwise valid request. */
+function isUntypedMediaPermission(
+  permission: ElectronPermission,
+  details?: ElectronPermissionDetails,
+): boolean {
+  if (permission !== 'media' || !details)
+    return false
+
+  if ('mediaTypes' in details)
+    return !details.mediaTypes?.length
+
+  if ('mediaType' in details)
+    return !details.mediaType
+
+  return true
 }
 
 /**
@@ -75,7 +97,7 @@ export function shouldGrantAudioCapturePermission(
   requestingOrigin?: string,
   details?: ElectronPermissionDetails,
 ): boolean {
-  return isAudioMediaPermission(permission, details)
+  return isSingleMediaPermission(permission, 'audio', details)
     && shouldGrantLocalAppPermission(webContents, requestingOrigin, details)
 }
 
@@ -84,11 +106,12 @@ export function shouldGrantAudioCapturePermission(
  *
  * Use when:
  * - Wiring both Electron permission check and request handlers
- * - Preserving reviewed local display-capture and clipboard behavior
+ * - Preserving reviewed local media, display-capture, and clipboard behavior
  *
  * Expects:
  * - Unknown or unreviewed permission categories must remain denied
  * - All explicit frame, security, and embedding origins must identify local AIRI pages
+ * - Untyped media may be granted only while the same WebContents owns an exact display-capture reservation
  *
  * Returns:
  * - Whether the requested permission is both allowlisted and locally owned
@@ -98,9 +121,16 @@ export function shouldGrantElectronPermission(
   permission: ElectronPermission,
   requestingOrigin?: string,
   details?: ElectronPermissionDetails,
+  hasPendingDisplayMediaRequest = false,
 ): boolean {
-  if (permission === 'media')
-    return shouldGrantAudioCapturePermission(webContents, permission, requestingOrigin, details)
+  if (permission === 'media') {
+    const singlePurposeCapture = isSingleMediaPermission(permission, 'audio', details)
+      || isSingleMediaPermission(permission, 'video', details)
+    const reservedDisplayCapture = hasPendingDisplayMediaRequest
+      && isUntypedMediaPermission(permission, details)
+    return (singlePurposeCapture || reservedDisplayCapture)
+      && shouldGrantLocalAppPermission(webContents, requestingOrigin, details)
+  }
 
   return LOCAL_APP_PERMISSION_NAMES.has(permission)
     && shouldGrantLocalAppPermission(webContents, requestingOrigin, details)
@@ -115,18 +145,37 @@ export function shouldGrantElectronPermission(
  * Expects:
  * - The session is the one used by AIRI renderer windows
  * - macOS systemPreferences remains responsible for OS-level consent prompts and status
+ * - The reservation query comes from the screen-capture module owning exact-source selection
  *
  * Returns:
  * - Nothing; both handlers are installed on the supplied session
  */
 export function setupMediaPermissionHandlers(
   targetSession: Pick<Session, 'setPermissionCheckHandler' | 'setPermissionRequestHandler'>,
+  hasPendingDisplayMediaRequest: (webContentsId: number) => boolean,
 ): void {
   targetSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
-    callback(shouldGrantElectronPermission(webContents, permission, undefined, details))
+    const ownsDisplayCaptureReservation = permission === 'media'
+      && hasPendingDisplayMediaRequest(webContents.id)
+    callback(shouldGrantElectronPermission(
+      webContents,
+      permission,
+      undefined,
+      details,
+      ownsDisplayCaptureReservation,
+    ))
   })
 
   targetSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) => {
-    return shouldGrantElectronPermission(webContents, permission, requestingOrigin, details)
+    const ownsDisplayCaptureReservation = permission === 'media'
+      && webContents !== null
+      && hasPendingDisplayMediaRequest(webContents.id)
+    return shouldGrantElectronPermission(
+      webContents,
+      permission,
+      requestingOrigin,
+      details,
+      ownsDisplayCaptureReservation,
+    )
   })
 }

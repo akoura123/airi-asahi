@@ -15,7 +15,6 @@ import type {
   UnDeepgramOptions,
   UnElevenLabsOptions,
   UnMicrosoftOptions,
-  UnVolcengineOptions,
   VoiceProviderWithExtraOptions,
 } from 'unspeech'
 
@@ -45,7 +44,6 @@ import {
   createUnDeepgram,
   createUnElevenLabs,
   createUnMicrosoft,
-  createUnVolcengine,
   listVoices,
 } from 'unspeech'
 import { computed, ref, watch } from 'vue'
@@ -54,6 +52,7 @@ import { useI18n } from 'vue-i18n'
 import { getKokoroAdapter } from '../libs/inference/adapters/kokoro'
 import { getProviderValidationIntervalMs, listProviders as listDefinedProviders, ProviderValidationCheck } from '../libs/providers'
 import { resolveProviderSourceMetadata } from '../libs/providers/source-metadata'
+import { SERVER_URL } from '../libs/server'
 import { getDefaultKokoroModel, KOKORO_MODELS, kokoroModelsToModelInfo } from '../workers/kokoro/constants'
 import { captureAnalyticsEvent, ensureAnalyticsInitialized, isAnalyticsAvailableInBuild } from './analytics/client'
 import { useAuthStore } from './auth'
@@ -75,11 +74,71 @@ const ALIYUN_NLS_REGIONS = [
   'cn-shenzhen-internal',
 ] as const
 
+const VOLCENGINE_V3_MODEL = 'seed-tts-2.0'
+const VOLCENGINE_V3_RELAY_BASE_URL = new URL('/api/v1/byok/volcengine/', SERVER_URL).toString()
+const VOLCENGINE_VOICE_CATALOG_BASE_URL = 'https://unspeech.hyp3r.link/'
+
+interface VolcengineV3SpeechOptions {
+  audio?: {
+    speedRatio?: number
+  }
+}
+
+interface QwenTranscriptionExtraOptions {
+  abortSignal?: AbortSignal
+  language?: string
+}
+
 type AliyunNlsRegion = typeof ALIYUN_NLS_REGIONS[number]
 
 function toListVoicesOptions<T>(provider: VoiceProviderWithExtraOptions<T>, options?: T): ListVoicesOptions {
   const { fetch: _fetch, ...voiceOptions } = provider.voice(options)
   return voiceOptions
+}
+
+/**
+ * Reads browser-owned audio blobs as data URLs for JSON audio APIs.
+ * FileReader is used because the provider runs in the renderer and must retain
+ * the blob MIME type in the encoded value sent to the upstream protocol.
+ */
+function readBlobAsDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        reject(new Error('The audio blob did not produce a data URL.'))
+        return
+      }
+      resolve(reader.result)
+    }
+    reader.onerror = () => reject(reader.error ?? new Error('Failed to read the audio blob.'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+/**
+ * Normalizes the Qwen chat-completions envelope into transcription text.
+ *
+ * Before:
+ * - `{ choices: [{ message: { content: "你好" } }] }`
+ *
+ * After:
+ * - `"你好"`
+ */
+function normalizeQwenTranscriptionText(response: unknown): string {
+  if (!response || typeof response !== 'object')
+    return ''
+
+  const choices = (response as Record<string, unknown>).choices
+  if (!Array.isArray(choices) || !choices[0] || typeof choices[0] !== 'object')
+    return ''
+
+  const message = (choices[0] as Record<string, unknown>).message
+  if (!message || typeof message !== 'object')
+    return ''
+
+  const content = (message as Record<string, unknown>).content
+  return typeof content === 'string' ? content.trim() : ''
 }
 
 /**
@@ -199,6 +258,15 @@ export interface ProviderMetadata {
    * In case of having image instead of icon, you can specify the image URL here.
    */
   iconImage?: string
+  /**
+   * Whether users may override this provider's API base URL.
+   *
+   * Providers backed by a fixed protocol adapter set this to `false` so every
+   * configuration surface uses the adapter-owned endpoint.
+   *
+   * @default true
+   */
+  baseUrlConfigurable?: boolean
   defaultOptions?: () => Record<string, unknown>
   onboardingFields?: ProviderOnboardingField[]
   createProvider: (
@@ -1410,23 +1478,49 @@ export const useProvidersStore = defineStore('providers', () => {
       nameKey: 'settings.pages.providers.provider.volcengine.title',
       name: 'settings.pages.providers.provider.volcengine.title',
       descriptionKey: 'settings.pages.providers.provider.volcengine.description',
-      description: 'volcengine.com',
+      description: 'Volcengine Seed-TTS 2.0 (V3)',
       iconColor: 'i-lobe-icons:volcengine',
+      baseUrlConfigurable: false,
       defaultOptions: () => ({
-        baseUrl: 'https://unspeech.hyp3r.link/v1/',
+        model: VOLCENGINE_V3_MODEL,
       }),
-      createProvider: async config => createUnVolcengine((config.apiKey as string).trim(), (config.baseUrl as string).trim()),
+      createProvider: async (config) => {
+        const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : ''
+        const provider: SpeechProviderWithExtraOptions<string, VolcengineV3SpeechOptions> = {
+          // This provider owns one fixed V3 resource. The model catalog and
+          // synthesis request share this constant so configuration state
+          // cannot change the resource header sent to Volcengine.
+          speech: (_model, options) => ({
+            apiKey,
+            baseURL: VOLCENGINE_V3_RELAY_BASE_URL,
+            model: VOLCENGINE_V3_MODEL,
+            ...(typeof options?.audio?.speedRatio === 'number'
+              ? { speed: options.audio.speedRatio }
+              : {}),
+          }),
+        }
+        return provider
+      },
       capabilities: {
-        listVoices: async (config) => {
-          const provider = createUnVolcengine((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnVolcengineOptions>
-
-          const voices = await listVoices(toListVoicesOptions(provider))
+        listVoices: async () => {
+          // Volcengine does not expose a browser-callable voice-list API. Keep
+          // using unspeech's generated catalog, but scope it to the exact V3
+          // resource used for synthesis so incompatible V1 voices stay hidden.
+          const query = new URLSearchParams({
+            provider: 'volcengine',
+            model: VOLCENGINE_V3_MODEL,
+          })
+          const voices = await listVoices({
+            baseURL: VOLCENGINE_VOICE_CATALOG_BASE_URL,
+            query: query.toString(),
+          })
 
           return voices.map((voice) => {
             return {
               id: voice.id,
               name: voice.name,
-              provider: 'volcano-engine',
+              provider: 'volcengine',
+              compatibleModels: voice.compatible_models,
               previewURL: voice.preview_audio_url,
               languages: voice.languages,
               gender: voice.labels?.gender,
@@ -1436,10 +1530,10 @@ export const useProvidersStore = defineStore('providers', () => {
         listModels: async () => {
           return [
             {
-              id: 'v1',
-              name: 'v1',
-              provider: 'volcano-engine',
-              description: '',
+              id: VOLCENGINE_V3_MODEL,
+              name: 'Seed-TTS 2.0',
+              provider: 'volcengine',
+              description: 'Volcengine V3',
               contextLength: 0,
               deprecated: false,
             },
@@ -1449,21 +1543,13 @@ export const useProvidersStore = defineStore('providers', () => {
       validators: {
         chatPingCheckAvailable: false,
         validateProviderConfig: (config) => {
-          const errors = [
-            !config.apiKey && new Error('API key is required.'),
-            !config.baseUrl && new Error('Base URL is required.'),
-            !((config.app as any)?.appId) && new Error('App ID is required.'),
-          ].filter(Boolean)
-
-          const res = baseUrlValidator.value(config.baseUrl)
-          if (res) {
-            return res
-          }
+          const hasApiKey = typeof config.apiKey === 'string' && config.apiKey.trim().length > 0
+          const errors = hasApiKey ? [] : [new Error('API key is required.')]
 
           return {
             errors,
             reason: errors.filter(e => e).map(e => String(e)).join(', ') || '',
-            valid: !!config.apiKey && !!config.baseUrl && !!config.app && !!(config.app as any).appId,
+            valid: hasApiKey,
           }
         },
       },
@@ -1831,6 +1917,129 @@ export const useProvidersStore = defineStore('providers', () => {
       ),
       validation: [ProviderValidationCheck.ModelList],
     }),
+    'alibaba-cloud-model-studio-transcription': {
+      id: 'alibaba-cloud-model-studio-transcription',
+      category: 'transcription',
+      tasks: ['speech-to-text', 'automatic-speech-recognition', 'asr', 'stt'],
+      nameKey: 'settings.pages.providers.provider.alibaba-cloud-model-studio.title',
+      name: 'Alibaba Cloud Model Studio',
+      descriptionKey: 'settings.pages.providers.provider.alibaba-cloud-model-studio.description',
+      description: 'bailian.console.aliyun.com',
+      iconColor: 'i-lobe-icons:alibabacloud',
+      defaultOptions: () => ({
+        baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1/',
+        model: 'qwen3-asr-flash',
+      }),
+      createProvider: async (config) => {
+        const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : ''
+        const baseUrl = `${(typeof config.baseUrl === 'string' ? config.baseUrl : 'https://dashscope.aliyuncs.com/compatible-mode/v1/').replace(/\/+$/, '')}/`
+        const defaultModel = typeof config.model === 'string' && config.model ? config.model : 'qwen3-asr-flash'
+
+        const provider: TranscriptionProviderWithExtraOptions<string, QwenTranscriptionExtraOptions> = {
+          transcription: (model, extraOptions) => ({
+            abortSignal: extraOptions?.abortSignal,
+            baseURL: baseUrl,
+            language: extraOptions?.language,
+            model: model || defaultModel,
+            fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+              if (!(init?.body instanceof FormData))
+                throw new Error('Qwen transcription requires multipart audio input.')
+
+              const file = init.body.get('file')
+              if (!(file instanceof Blob))
+                throw new Error('Qwen transcription requires an audio file.')
+
+              const requestedModel = init.body.get('model')
+              const language = init.body.get('language')
+              const response = await fetch(`${baseUrl}chat/completions`, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${apiKey}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  model: typeof requestedModel === 'string' && requestedModel ? requestedModel : defaultModel,
+                  messages: [{
+                    role: 'user',
+                    content: [{
+                      type: 'input_audio',
+                      input_audio: {
+                        data: await readBlobAsDataUrl(file),
+                      },
+                    }],
+                  }],
+                  asr_options: {
+                    enable_itn: true,
+                    ...(typeof language === 'string' && language ? { language } : {}),
+                  },
+                }),
+                signal: init.signal ?? extraOptions?.abortSignal,
+              })
+
+              const responseBody = await response.text()
+              if (!response.ok) {
+                throw new Error(
+                  `Qwen transcription failed: ${response.status} ${response.statusText}${responseBody ? ` — ${responseBody}` : ''}`,
+                )
+              }
+
+              let result: unknown
+              try {
+                result = JSON.parse(responseBody)
+              }
+              catch (error) {
+                throw new Error('Qwen transcription returned invalid JSON.', { cause: error })
+              }
+
+              const text = normalizeQwenTranscriptionText(result)
+              if (!text)
+                throw new Error('Qwen transcription returned no text.')
+
+              return new Response(JSON.stringify({ text }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              })
+            },
+          }),
+        }
+
+        return provider
+      },
+      capabilities: {
+        listModels: async () => [{
+          id: 'qwen3-asr-flash',
+          name: 'Qwen3-ASR-Flash',
+          provider: 'alibaba-cloud-model-studio-transcription',
+          description: 'Qwen3 segmented speech recognition',
+          contextLength: 0,
+          deprecated: false,
+        }],
+      },
+      transcriptionFeatures: {
+        supportsGenerate: true,
+        supportsStreamOutput: false,
+        supportsStreamInput: false,
+      },
+      validators: {
+        chatPingCheckAvailable: false,
+        validateProviderConfig: (config) => {
+          const errors = [
+            !config.apiKey && new Error('API key is required.'),
+            !config.baseUrl && new Error('Base URL is required.'),
+          ].filter(Boolean)
+
+          const baseUrlError = baseUrlValidator.value(config.baseUrl)
+          if (baseUrlError)
+            return baseUrlError
+
+          return {
+            errors,
+            reason: errors.map(error => (error as Error).message).join(', '),
+            valid: errors.length === 0,
+          }
+        },
+      },
+    },
     'mimo-audio-transcription': {
       id: 'mimo-audio-transcription',
       category: 'transcription',
@@ -1863,13 +2072,7 @@ export const useProvidersStore = defineStore('providers', () => {
                 throw new Error('No audio file provided for transcription.')
               }
 
-              // Read the file as base64 data URI (works with both Blob and File)
-              const base64DataUri: string = await new Promise((resolve, reject) => {
-                const reader = new FileReader()
-                reader.onload = () => resolve(reader.result as string)
-                reader.onerror = () => reject(new Error('Failed to read audio file'))
-                reader.readAsDataURL(file)
-              })
+              const base64DataUri = await readBlobAsDataUrl(file)
 
               // Extract format and base64 data from data URI
               // data:audio/wav;base64,UklGR...

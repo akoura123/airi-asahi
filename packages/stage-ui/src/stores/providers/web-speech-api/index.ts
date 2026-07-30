@@ -165,12 +165,13 @@ export function streamWebSpeechAPITranscription(
     onSentenceEnd?: (delta: string) => void
     onSpeechEnd?: (text: string) => void
   },
-): StreamTranscriptionResult & { recognition?: any } {
+): StreamTranscriptionResult & { recognition?: any, finish?: () => void } {
   const deferredText = createDeferred<string>()
   let fullText = ''
   let textStreamCtrl: ReadableStreamDefaultController<string> | undefined
   let fullStreamCtrl: ReadableStreamDefaultController<StreamTranscriptionDelta> | undefined
   let recognitionInstance: any = null
+  let finishing = false
 
   const fullStream = new ReadableStream<StreamTranscriptionDelta>({
     start(controller) {
@@ -186,6 +187,7 @@ export function streamWebSpeechAPITranscription(
       // Clean up recognition when stream is cancelled
       if (recognitionInstance) {
         try {
+          finishing = true
           recognitionInstance.stop()
         }
         catch {}
@@ -289,7 +291,7 @@ export function streamWebSpeechAPITranscription(
     console.info('Web Speech API recognition ended. Continuous mode:', options?.continuous !== false, 'Aborted:', options?.abortSignal?.aborted)
 
     // If continuous mode and not aborted, restart recognition
-    if (options?.continuous !== false && !options?.abortSignal?.aborted) {
+    if (options?.continuous !== false && !options?.abortSignal?.aborted && !finishing) {
       // Use the current recognitionInstance to ensure we're using the correct instance
       const currentRecognition = recognitionInstance || recognition
 
@@ -342,6 +344,7 @@ export function streamWebSpeechAPITranscription(
   if (options?.abortSignal) {
     options.abortSignal.addEventListener('abort', () => {
       try {
+        finishing = true
         recognition.stop()
       }
       catch {}
@@ -468,5 +471,9 @@ export function streamWebSpeechAPITranscription(
     text: deferredText.promise,
     textStream,
     recognition: recognitionInstance,
+    finish: () => {
+      finishing = true
+      recognitionInstance?.stop()
+    },
   }
 }

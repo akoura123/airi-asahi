@@ -219,6 +219,7 @@ async function startRealtimeSession(options: InternalRealtimeOptions): Promise<A
 
   const stopWaiter = createWaiter(stopAckTimeoutMs, abortSignal)
   let stopping = false
+  let terminationReported = false
 
   async function requestStop(reason?: unknown) {
     if (stopping)
@@ -273,7 +274,10 @@ async function startRealtimeSession(options: InternalRealtimeOptions): Promise<A
       }
     }
 
-    await onSessionTerminated?.(error)
+    if (!terminationReported) {
+      terminationReported = true
+      await onSessionTerminated?.(error)
+    }
   }
 
   const handle: AliyunStreamTranscriptionHandle = {
@@ -283,21 +287,20 @@ async function startRealtimeSession(options: InternalRealtimeOptions): Promise<A
   async function onTranscriptionStarted() {
     try {
       while (true) {
-        if (abortSignal?.aborted) {
-          break
-        }
+        if (abortSignal?.aborted)
+          return
 
         const { done, value } = await reader.read()
-        if (done)
-          break
+        if (done) {
+          if (!abortSignal?.aborted)
+            await requestStop()
+          return
+        }
         if (value)
           websocket!.send(toArrayBuffer(value))
 
         bumpIdle()
       }
-
-      // Allow a grace period for server to flush final events before stop.
-      bumpIdle()
     }
     catch (error) {
       await cleanup(error)

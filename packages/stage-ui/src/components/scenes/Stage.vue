@@ -40,6 +40,8 @@ import { getDefaultStreamingModel, getDefinedProvider } from '../../libs/provide
 import { OFFICIAL_SPEECH_PROVIDER_ID, OFFICIAL_SPEECH_STREAMING_PROVIDER_ID } from '../../libs/providers/providers/official'
 import { bindSpeakingStateToPlaybackManager } from '../../libs/speech/playback-speaking-state'
 import { createStageTtsSession } from '../../libs/speech/tts-session'
+import { routeMeetingAgentAudioSource } from '../../services/meeting-audio'
+import { registerMeetingStageFrameSource } from '../../services/meeting-video'
 import { getSpeechBusContext, speechOutputGetPlaybackState } from '../../services/speech/bus'
 import { useAudioContext, useSpeakingStore } from '../../stores/audio'
 import { useBackgroundStore } from '../../stores/background'
@@ -55,9 +57,12 @@ import { useSpeechRuntimeStore } from '../../stores/speech-runtime'
 const props = withDefaults(defineProps<{
   cursorPosition?: { x: number, y: number }
   enableOrbitControls?: boolean
+  /** Registers this Stage as the process-local source for meeting video composition. */
+  meetingMediaSource?: boolean
   paused?: boolean
 }>(), {
   enableOrbitControls: true,
+  meetingMediaSource: false,
   paused: false,
 })
 
@@ -192,6 +197,22 @@ const backgroundStore = useBackgroundStore()
 const { activeBackgroundUrl } = storeToRefs(backgroundStore)
 
 const { currentMotion } = storeToRefs(useLive2dParams())
+const meetingMediaSourceOwnerId = props.meetingMediaSource ? `stage:${crypto.randomUUID()}` : ''
+let disposeMeetingMediaSource: (() => void) | undefined
+
+function meetingStageRenderer() {
+  const renderer = stageModelRenderer.value
+  if (renderer === 'live2d'
+    || renderer === 'vrm'
+    || renderer === 'spine'
+    || renderer === 'tachie'
+    || renderer === 'mmd'
+    || renderer === 'godot') {
+    return renderer
+  }
+
+  return null
+}
 
 const emotionsQueue = createQueue<EmotionPayload>({
   handlers: [
@@ -315,7 +336,9 @@ async function playFunction(item: Parameters<Parameters<typeof createPlaybackMan
   currentAudioSource.value = source
   source.buffer = item.audio
 
-  source.connect(audioContext.destination)
+  const meetingAudioRoute = await routeMeetingAgentAudioSource(source, audioContext)
+  if (meetingAudioRoute.localMonitor)
+    source.connect(audioContext.destination)
   if (audioAnalyser.value)
     source.connect(audioAnalyser.value)
   if (lipSyncNode.value)
@@ -917,6 +940,31 @@ if (typeof window !== 'undefined') {
 }
 
 onMounted(async () => {
+  if (props.meetingMediaSource) {
+    disposeMeetingMediaSource = registerMeetingStageFrameSource({
+      ownerId: meetingMediaSourceOwnerId,
+      renderer: meetingStageRenderer,
+      read: () => {
+        const renderer = meetingStageRenderer()
+        const canvas = canvasElement()
+        if (!renderer || !canvas)
+          return null
+
+        const stageBackgroundColor = getComputedStyle(document.documentElement)
+          .getPropertyValue('--bg-color')
+          .trim()
+
+        return {
+          canvas,
+          renderer,
+          capturedAtMs: Date.now(),
+          stageBackgroundUrl: activeBackgroundUrl.value,
+          stageBackgroundColor: stageBackgroundColor || null,
+        }
+      },
+    })
+  }
+
   await getDb() // stub for future update
 })
 
@@ -1019,6 +1067,8 @@ async function captureFrame() {
 }
 
 onUnmounted(() => {
+  disposeMeetingMediaSource?.()
+  disposeMeetingMediaSource = undefined
   disposePlaybackStateHandler()
   resetLive2dLipSync()
   chatHookCleanups.forEach(dispose => dispose?.())

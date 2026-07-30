@@ -7,6 +7,7 @@ import type { GodotStageManager } from '../../../services/airi/godot-stage'
 import type { McpStdioManager } from '../../../services/airi/mcp-servers'
 import type { AutoUpdater } from '../../../services/electron/auto-updater'
 import type { GlobalShortcutService } from '../../../services/electron/global-shortcut'
+import type { MeetingMediaService } from '../../../services/electron/meeting-media'
 import type { DevtoolsWindowManager } from '../../devtools'
 import type { SpotlightWindowManager } from '../../spotlight'
 import type { WidgetsWindowManager } from '../../widgets'
@@ -43,6 +44,7 @@ export async function setupSettingsWindowInvokes(params: {
   windowAuthManager: WindowAuthManager
   globalShortcut: GlobalShortcutService
   spotlightWindow: SpotlightWindowManager
+  meetingMedia: MeetingMediaService
 }) {
   // TODO: once we refactored eventa to support window-namespaced contexts,
   // we can remove the setMaxListeners call below since eventa will be able to dispatch and
@@ -58,6 +60,7 @@ export async function setupSettingsWindowInvokes(params: {
   createMcpServersService({ context, manager: params.mcpStdioManager })
   createGodotStageService({ context, manager: params.godotStageManager, window: params.settingsWindow })
   createAuthService({ context, window: params.settingsWindow, windowAuthManager: params.windowAuthManager })
+  params.meetingMedia.registerWindow({ context, window: params.settingsWindow })
 
   // Register the global shortcut service for the settings window.
   params.globalShortcut.registerWindow({ context, window: params.settingsWindow })

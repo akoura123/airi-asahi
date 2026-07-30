@@ -52,19 +52,19 @@ describe('media permissions', () => {
     )).toBe(true)
   })
 
-  /** @example Camera-only requests remain denied. */
-  it('rejects video-only media permission requests', () => {
-    expect(shouldGrantAudioCapturePermission(
+  /** @example Local packaged pages may request camera-only media for device authorization. */
+  it('grants local video-only media permission requests', () => {
+    expect(shouldGrantElectronPermission(
       localWebContents,
       'media',
       undefined,
       createMediaRequestDetails({ mediaTypes: ['video'] }),
-    )).toBe(false)
+    )).toBe(true)
   })
 
   /** @example Combined microphone and camera requests remain denied. */
   it('rejects media permission requests that include video', () => {
-    expect(shouldGrantAudioCapturePermission(
+    expect(shouldGrantElectronPermission(
       localWebContents,
       'media',
       undefined,
@@ -79,6 +79,44 @@ describe('media permissions', () => {
       'media',
       undefined,
       createMediaRequestDetails(),
+    )).toBe(false)
+  })
+
+  it('rejects untyped media requests without an exact display-capture reservation', () => {
+    expect(shouldGrantElectronPermission(
+      localWebContents,
+      'media',
+      undefined,
+      createMediaRequestDetails({ mediaTypes: [] }),
+    )).toBe(false)
+  })
+
+  it('grants a local untyped media request correlated with an exact display-capture reservation', () => {
+    // ROOT CAUSE:
+    //
+    // Electron 41 reports getDisplayMedia as a `media` permission request with an
+    // empty mediaTypes array before the exact-source display handler supplies tracks.
+    // Treating it like a generic media request blocks the already reserved capture.
+    // We grant it only while the same WebContents owns that short-lived reservation.
+    expect(shouldGrantElectronPermission(
+      localWebContents,
+      'media',
+      undefined,
+      createMediaRequestDetails({ mediaTypes: [] }),
+      true,
+    )).toBe(true)
+  })
+
+  it('rejects remote untyped media even during an exact display-capture reservation', () => {
+    expect(shouldGrantElectronPermission(
+      localWebContents,
+      'media',
+      undefined,
+      createMediaRequestDetails({
+        mediaTypes: [],
+        requestingUrl: 'https://example.com/capture.html',
+      }),
+      true,
     )).toBe(false)
   })
 

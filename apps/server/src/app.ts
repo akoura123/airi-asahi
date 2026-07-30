@@ -66,6 +66,7 @@ import { createAdminVoicePackRoutes } from './routes/admin/voice-packs'
 import { createAudioSpeechWsHandlers } from './routes/audio-speech-ws'
 import { createAudioTranscriptionStreamHandler } from './routes/audio-transcription-stream/route'
 import { createAuthRoutes } from './routes/auth'
+import { createVolcengineByokSpeechRoutes } from './routes/byok/volcengine-speech'
 import { createCharacterRoutes } from './routes/characters'
 import { createChatWsHandlers } from './routes/chat-ws'
 import { createChatRoutes } from './routes/chats'
@@ -235,6 +236,13 @@ export async function buildApp(deps: AppDeps) {
     envelopeCrypto: deps.envelopeCrypto,
     providerCatalogService: deps.providerCatalogService,
   }))
+
+  // Volcengine's new-console V3 endpoint requires `X-Api-Key`, which its
+  // browser CORS preflight does not currently allow. This fixed-upstream BYOK
+  // relay receives the caller's key as Bearer auth and translates it server-
+  // side. Register it before sessionMiddleware: this Authorization header is
+  // a provider credential, not an AIRI login token.
+  app.route('/api/v1/byok/volcengine', createVolcengineByokSpeechRoutes())
 
   // Cross-instance config invalidation. The subscriber owns its own
   // connection + lifecycle metrics; see services/llm-router/config-sync-subscriber.ts.

@@ -5,6 +5,7 @@ import type { GodotStageManager } from '../../services/airi/godot-stage'
 import type { McpStdioManager } from '../../services/airi/mcp-servers'
 import type { AutoUpdater } from '../../services/electron/auto-updater'
 import type { GlobalShortcutService } from '../../services/electron/global-shortcut'
+import type { MeetingMediaService } from '../../services/electron/meeting-media'
 import type { DevtoolsWindowManager } from '../devtools'
 import type { SpotlightWindowManager } from '../spotlight'
 import type { WidgetsWindowManager } from '../widgets'
@@ -40,6 +41,7 @@ export function setupSettingsWindowReusableFunc(params: {
   windowAuthManager: WindowAuthManager
   globalShortcut: GlobalShortcutService
   spotlightWindow: SpotlightWindowManager
+  meetingMedia: MeetingMediaService
 }): SettingsWindowManager {
   const rendererBase = baseUrl(resolve(getElectronMainDirname(), '..', 'renderer'))
   const defaultRoute = '/settings'
@@ -79,6 +81,7 @@ export function setupSettingsWindowReusableFunc(params: {
       windowAuthManager: params.windowAuthManager,
       globalShortcut: params.globalShortcut,
       spotlightWindow: params.spotlightWindow,
+      meetingMedia: params.meetingMedia,
     })
 
     await load(window, withHashRoute(rendererBase, currentRoute))

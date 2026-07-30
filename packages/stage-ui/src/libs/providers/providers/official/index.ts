@@ -361,7 +361,8 @@ export const providerOfficialTranscription = defineProvider({
   createProviderConfig: () => officialConfigSchema,
   createProvider(_config) {
     return {
-      transcription: (model: string) => ({
+      transcription: (model: string, extraOptions?: { abortSignal?: AbortSignal }) => ({
+        abortSignal: extraOptions?.abortSignal,
         baseURL: new URL(`${SERVER_URL}/api/v1/audio/transcriptions/stream`),
         fetch: withCredentials(),
         model,

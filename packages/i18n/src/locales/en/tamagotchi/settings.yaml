@@ -7,6 +7,190 @@ spotlight:
     prefix: 'Something went wrong: {message}'
     shortcutRegistrationFailed: 'Something went wrong: failed to register Spotlight shortcut.'
 pages:
+  meeting-media:
+    title: Meeting Media
+    description: Manage AIRI's virtual camera, meeting return audio, and virtual microphone
+    routes:
+      video-out: Virtual camera
+      remote-audio-in: Meeting audio input
+      agent-audio-out: AIRI virtual microphone
+    actions:
+      check: Run preflight
+      refresh-devices: Refresh devices
+      start: Start meeting media
+      stop: Stop meeting media
+    runtime:
+      title: Session control
+      description: One session starts and stops all three routes. A failed required route can never appear as running.
+      states:
+        idle: Not started
+        starting: Starting
+        running: Running
+        stopping: Stopping
+        error: Blocked
+      bridge-unavailable-title: Desktop media bridge unavailable
+      bridge-unavailable-description: This window is not connected to the Electron Main meeting-media control channel.
+      bridge-error: Media bridge communication failed
+      bridge-error-description: Meeting-media state could not be read. Check the application log and retry.
+      error-code: Error code
+      error-route: Route
+      pending-profile-title: Configuration applies on the next start
+      pending-profile-description: The active session keeps its start-time snapshot. Stop and restart to apply these changes.
+      session: Session ID
+      video-fps: Video output rate
+      speech-segments: Speech segments
+    preflight:
+      title: Preflight
+      description: The selected backend decides readiness. Browser enumeration supports diagnostics and never replaces exact checks.
+      component: Backend component
+      permission: System permission
+      status:
+        not-checked: Not checked
+        not-required: Disabled
+        ready: Ready
+        blocked: Not ready
+      values:
+        ready: Ready
+        not-bundled: Not bundled
+        not-installed: Not installed
+        unverified: Installation unverified
+        not-required: Not required
+        granted: Granted
+        denied: Denied
+        not-determined: Not requested
+        restricted: Restricted
+        unavailable: Unavailable
+    devices:
+      title: Renderer-visible devices
+      description: Used to select exact capture and audio-output devices and confirm Chromium can enumerate the selected bridge.
+      detected: Detected
+      not-detected: Not detected
+      labels-unavailable: Device names are hidden. Grant system media permission, then refresh the device list.
+      unnamed-output: Audio output {index}
+    profile:
+      title: Media profile
+      description: The profile is frozen when a session starts. Edits made while running do not alter the active session.
+      invalid-title: Profile was not saved
+      invalid-description: This edit would create an invalid profile. Keep at least one route enabled and check numeric ranges.
+      backend:
+        title: Media backend
+        description: Compatibility uses OBS, macOS application-audio capture, and BlackHole. Native devices remain a separate explicit target.
+        options:
+          compatibility: Compatibility bridge (OBS + BlackHole)
+          native: AIRI native virtual devices
+      video:
+        title: Virtual camera
+        enabled: Enable video output
+        enabled-description: Require the selected video backend to be ready for this session.
+        compatibility-description: AIRI switches its main Stage window to a fixed clean output named "AIRI Meeting Output". Capture that window in OBS and publish it through OBS Virtual Camera.
+        authorize-input: Authorize OBS Virtual Camera
+        resolution: Output format
+        fit: Frame fit
+        fit-options:
+          contain: Show full frame (contain)
+          cover: Fill and crop (cover)
+        background: Transparent-area background
+        background-options:
+          stage: Use Stage background
+          color: Use a solid color
+        background-color: Background color
+        mirror: Mirror source
+        mirror-description: Flip the frame sent to the meeting client independently of its local preview setting.
+      receive-audio:
+        title: Meeting audio input
+        enabled: Enable meeting return audio
+        enabled-description: Capture meeting return audio and feed the same VAD/ASR turn pipeline.
+        capture-source: Meeting application window
+        capture-description: Select the exact Tencent Meeting window. AIRI will not switch to another window when this source expires.
+        capture-placeholder: Select a running meeting window
+        monitor: Physical monitor device
+        monitor-description: Copy meeting audio to this physical speaker or headset without selecting AIRI Meeting Speaker itself.
+        monitor-placeholder: Select a physical output
+        labels-unavailable: Selection is disabled while names are hidden to prevent an audio loop.
+        gain: Monitor volume
+      speech:
+        title: VAD and ASR
+        use-current: Use current Hearing settings
+        provider: ASR provider ID
+        provider-placeholder: Enter a provider that explicitly supports the meeting segmentation contract
+        model: ASR model
+        locale: Recognition locale
+        mode: Recognition mode
+        mode-options:
+          streaming: Streaming recognition
+          batch: Segmented batch recognition
+      vad:
+        title: VAD segmentation
+        threshold: Speech threshold
+        silence: Minimum silence (milliseconds)
+        padding: Speech padding (milliseconds)
+        minimum-speech: Minimum speech (milliseconds)
+      agent-audio:
+        title: AIRI speech output
+        enabled: Enable virtual microphone
+        enabled-description: Route the same decoded AIRI TTS to the selected meeting microphone output.
+        output-device: Compatibility audio output
+        output-description: Select BlackHole 2ch, then keep BlackHole 2ch selected as the microphone in Tencent Meeting.
+        output-placeholder: Select BlackHole 2ch
+        authorize-output: Authorize BlackHole 2ch output
+        local-monitor: Also play AIRI speech locally
+      duplex:
+        title: Duplex policy
+        description: Isolated buses use full duplex by default. Half duplex pauses recognition while AIRI speaks.
+        options:
+          full: Full duplex
+          half: Half duplex
+    errors:
+      PLATFORM_VERSION_UNSUPPORTED: This operating-system version cannot host the media route.
+      NATIVE_COMPONENT_NOT_BUNDLED: This AIRI build does not contain the required native media component.
+      NATIVE_COMPONENT_MANIFEST_INVALID: The native component manifest is invalid or uses an incompatible protocol.
+      NATIVE_COMPONENT_INSTALLATION_UNVERIFIED: The native component was found, but its installed system device is not verified.
+      MEDIA_PERMISSION_DENIED: System media permission has not been granted.
+      MEDIA_VIDEO_INPUT_AUTHORIZATION_UNAVAILABLE: The current Electron runtime cannot authorize a video input device.
+      MEDIA_MATCHING_VIDEO_INPUT_UNAVAILABLE: OBS Virtual Camera was not found. Confirm that the OBS virtual camera is running.
+      MEDIA_VIDEO_INPUT_AUTHORIZATION_FAILED: OBS Virtual Camera authorization failed. Check camera permission and try again.
+      MEDIA_AUDIO_OUTPUT_AUTHORIZATION_UNAVAILABLE: The current Electron runtime cannot authorize a non-default audio output device.
+      MEDIA_MATCHING_AUDIO_INPUT_UNAVAILABLE: The BlackHole 2ch input was not found, so its matching output cannot be authorized.
+      MEDIA_AUDIO_OUTPUT_AUTHORIZATION_FAILED: BlackHole 2ch output authorization failed. Check microphone permission and try again.
+      MEETING_MEDIA_NATIVE_HOST_UNAVAILABLE: This build does not provide the native meeting-media session host yet.
+      MEETING_MEDIA_PREFLIGHT_FAILED: Native preflight could not be completed.
+      MEETING_MEDIA_ROUTE_NOT_READY: At least one required media route is not ready.
+      MEETING_MEDIA_PROFILE_INVALID: The meeting-media profile is invalid.
+      MEETING_MEDIA_SERVICE_DISPOSED: The meeting-media service is closed. Restart AIRI.
+      MEETING_MEDIA_SESSION_ALREADY_ACTIVE: Another meeting-media session is starting, running, or stopping.
+      MEETING_MEDIA_SESSION_STALE: This operation belongs to an expired meeting-media session.
+      MEETING_MEDIA_MONITOR_DEVICE_REQUIRED: Select a physical monitor device for meeting audio.
+      MEETING_MEDIA_SPEECH_CONFIG_REQUIRED: Configure the ASR provider, model, and recognition locale.
+      MEETING_MEDIA_COMPATIBILITY_PLATFORM_UNSUPPORTED: The compatibility backend currently requires macOS 13 or later.
+      MEETING_MEDIA_OBS_NOT_INSTALLED: OBS Studio was not found in the system or user Applications folder.
+      MEETING_MEDIA_SCREEN_AUDIO_PERMISSION_REQUIRED: Grant AIRI Screen and System Audio Recording permission in macOS Settings.
+      MEETING_MEDIA_CAPTURE_SOURCE_REQUIRED: Select the exact running meeting application window.
+      MEETING_MEDIA_CAPTURE_SOURCE_UNAVAILABLE: The selected meeting application window is no longer available; refresh and select it again.
+      MEETING_MEDIA_BLACKHOLE_NOT_INSTALLED: BlackHole 2ch was not found by the compatibility preflight.
+      MEETING_MEDIA_AGENT_OUTPUT_DEVICE_REQUIRED: Select BlackHole 2ch as AIRI's compatibility audio output.
+      MEETING_MEDIA_AGENT_OUTPUT_DEVICE_INVALID: AIRI's compatibility audio output must be BlackHole 2ch.
+      MEETING_MEDIA_RENDERER_HOST_UNAVAILABLE: The main AIRI Stage window is unavailable. Reopen it and retry.
+      MEETING_MEDIA_RENDERER_HOST_START_FAILED: The main Stage renderer could not start the compatibility bridge.
+      MEETING_MEDIA_RENDERER_HOST_STOP_FAILED: The renderer reported an error while cleaning up the compatibility bridge.
+      MEETING_MEDIA_RENDERER_ROUTE_START_FAILED: A required compatibility media route could not start.
+      MEETING_MEDIA_SPEECH_PIPELINE_FAILED: The meeting VAD or ASR pipeline failed.
+      MEETING_MEDIA_DIALOGUE_INGEST_FAILED: The recognized meeting turn could not be delivered to AIRI.
+      MEETING_MEDIA_STAGE_FRAME_UNAVAILABLE: The active Stage stopped providing frames.
+      MEETING_MEDIA_VIDEO_COMPOSITION_FAILED: The clean meeting output could not be composed.
+      MEETING_MEDIA_CAPTURE_STREAM_ENDED: The selected meeting application's audio capture ended.
+      MEETING_MEDIA_AGENT_OUTPUT_FAILED: AIRI TTS could not be written to the selected virtual audio output.
+      STAGE_FRAME_UNAVAILABLE: The active character renderer has no complete frame to publish.
+      STAGE_BACKGROUND_UNAVAILABLE: The active Stage has no background suitable for opaque output.
+      MEETING_BACKGROUND_UNRESOLVED: The selected meeting background could not be resolved.
+      MEETING_BACKGROUND_LOAD_FAILED: The selected meeting background could not be loaded.
+      MEETING_BACKGROUND_COLOR_INVALID: The meeting background color is invalid.
+      MEETING_COMPOSITOR_CONTEXT_UNAVAILABLE: The meeting video compositor could not be created.
+      PCM_SESSION_STALE: An audio frame from a stale session was received.
+      PCM_SEQUENCE_DISCONTINUITY: Meeting audio frame sequence is discontinuous.
+      PCM_FORMAT_INVALID: Meeting audio does not satisfy the pipeline format contract.
+      PCM_INPUT_TOO_LARGE: One meeting audio callback exceeded the bounded buffer limit.
+      MEDIA_DEVICE_ENUMERATION_UNAVAILABLE: Media-device enumeration is unavailable in this environment.
+      MEDIA_DEVICE_ENUMERATION_FAILED: The current media-device list could not be read.
   modules:
     mcp-server:
       description: Connect and manage MCP server and tools

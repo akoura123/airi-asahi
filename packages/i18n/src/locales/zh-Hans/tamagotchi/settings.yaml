@@ -7,6 +7,190 @@ spotlight:
     prefix: '出错啦：{message}'
     shortcutRegistrationFailed: '出错啦：快捷键注册失败'
 pages:
+  meeting-media:
+    title: 会议媒体
+    description: 管理 AIRI 虚拟摄像头、会议回传音频和虚拟麦克风
+    routes:
+      video-out: 虚拟摄像头
+      remote-audio-in: 会议声音接入
+      agent-audio-out: AIRI 虚拟麦克风
+    actions:
+      check: 执行会前检查
+      refresh-devices: 刷新设备
+      start: 开始会议媒体
+      stop: 停止会议媒体
+    runtime:
+      title: 会话控制
+      description: 三条媒体路由由同一个会话启动和停止，任一必需路由失败都不会显示为运行中。
+      states:
+        idle: 未启动
+        starting: 启动中
+        running: 运行中
+        stopping: 停止中
+        error: 已阻断
+      bridge-unavailable-title: 桌面媒体桥不可用
+      bridge-unavailable-description: 当前窗口未连接 Electron Main 的会议媒体控制通道。
+      bridge-error: 媒体桥通信失败
+      bridge-error-description: 无法读取会议媒体状态，请检查应用日志后重试。
+      error-code: 错误码
+      error-route: 所属路由
+      pending-profile-title: 配置将在下次启动时生效
+      pending-profile-description: 当前运行会话使用启动时冻结的配置；请先停止会话再重新启动。
+      session: 会话 ID
+      video-fps: 视频输出帧率
+      speech-segments: 语音段数量
+    preflight:
+      title: 会前检查
+      description: 当前明确选择的后端决定能否启动；浏览器设备枚举只用于辅助诊断，不代替精确检查。
+      component: 后端组件
+      permission: 系统权限
+      status:
+        not-checked: 未检查
+        not-required: 未启用
+        ready: 已就绪
+        blocked: 未就绪
+      values:
+        ready: 已就绪
+        not-bundled: 未随应用提供
+        not-installed: 未安装
+        unverified: 未验证安装
+        not-required: 不需要
+        granted: 已授权
+        denied: 已拒绝
+        not-determined: 尚未询问
+        restricted: 受系统限制
+        unavailable: 不可用
+    devices:
+      title: Renderer 可见设备
+      description: 用于精确选择会议捕获源和音频输出，并确认 Chromium 能枚举所选桥接设备。
+      detected: 已发现
+      not-detected: 未发现
+      labels-unavailable: 当前设备名称不可见；请先完成系统媒体授权，再刷新设备。
+      unnamed-output: 音频输出 {index}
+    profile:
+      title: 媒体配置
+      description: 配置会在开始会话时冻结；运行期修改不会改变当前会话。
+      invalid-title: 配置未保存
+      invalid-description: 该修改会产生无效配置。至少保留一条媒体路由，并检查数值范围。
+      backend:
+        title: 媒体后端
+        description: 兼容桥使用 OBS、macOS 应用音频捕获和 BlackHole；AIRI 原生虚拟设备仍是另一条显式目标路径。
+        options:
+          compatibility: 兼容桥（OBS + BlackHole）
+          native: AIRI 原生虚拟设备
+      video:
+        title: 虚拟摄像头
+        enabled: 启用视频输出
+        enabled-description: 要求本会话选择的视频后端已经就绪。
+        compatibility-description: AIRI 会把主 Stage 窗口切换成固定的纯净输出窗口“AIRI Meeting Output”。请在 OBS 中捕获该窗口，再通过 OBS Virtual Camera 发布。
+        authorize-input: 授权 OBS Virtual Camera
+        resolution: 输出规格
+        fit: 画面适配
+        fit-options:
+          contain: 完整显示（contain）
+          cover: 铺满裁切（cover）
+        background: 透明区域背景
+        background-options:
+          stage: 使用 Stage 背景
+          color: 使用纯色
+        background-color: 背景颜色
+        mirror: 源端镜像
+        mirror-description: 直接翻转送往会议客户端的画面，与客户端本地预览镜像无关。
+      receive-audio:
+        title: 会议声音接入
+        enabled: 启用会议回传音频
+        enabled-description: 捕获会议回传声音，并送入统一的 VAD/ASR 对话流水线。
+        capture-source: 会议应用窗口
+        capture-description: 精确选择腾讯会议窗口；该窗口失效后 AIRI 不会自动切换到其他窗口。
+        capture-placeholder: 选择正在运行的会议窗口
+        monitor: 物理监听设备
+        monitor-description: 会议声音将复制到该物理扬声器或耳机；不会选择 AIRI Meeting Speaker 自身。
+        monitor-placeholder: 选择物理输出设备
+        labels-unavailable: 设备名称不可见时禁止选择，以避免形成音频回环。
+        gain: 监听音量
+      speech:
+        title: VAD 与 ASR
+        use-current: 使用当前听觉配置
+        provider: ASR Provider ID
+        provider-placeholder: 明确填写支持会议分段契约的 Provider
+        model: ASR 模型
+        locale: 识别语言
+        mode: 识别方式
+        mode-options:
+          streaming: 流式识别
+          batch: 分段批量识别
+      vad:
+        title: VAD 分段参数
+        threshold: 语音阈值
+        silence: 最短静音时长（毫秒）
+        padding: 语音前后填充（毫秒）
+        minimum-speech: 最短语音时长（毫秒）
+      agent-audio:
+        title: AIRI 语音输出
+        enabled: 启用虚拟麦克风
+        enabled-description: 把同一次解码的 AIRI TTS 送入所选会议麦克风输出。
+        output-device: 兼容桥音频输出
+        output-description: 请选择 BlackHole 2ch，并在腾讯会议中继续把 BlackHole 2ch 作为麦克风。
+        output-placeholder: 选择 BlackHole 2ch
+        authorize-output: 授权 BlackHole 2ch 输出
+        local-monitor: 同时在本地播放 AIRI 语音
+      duplex:
+        title: 双工策略
+        description: 隔离总线默认使用全双工；半双工会在 AIRI 发声时暂停会议识别。
+        options:
+          full: 全双工
+          half: 半双工
+    errors:
+      PLATFORM_VERSION_UNSUPPORTED: 当前操作系统版本不支持此媒体路由。
+      NATIVE_COMPONENT_NOT_BUNDLED: 当前 AIRI 构建未包含所需原生媒体组件。
+      NATIVE_COMPONENT_MANIFEST_INVALID: 原生媒体组件清单无效或协议版本不匹配。
+      NATIVE_COMPONENT_INSTALLATION_UNVERIFIED: 已发现原生组件，但尚未验证系统设备安装状态。
+      MEDIA_PERMISSION_DENIED: 系统媒体权限未授权。
+      MEDIA_VIDEO_INPUT_AUTHORIZATION_UNAVAILABLE: 当前 Electron 运行时无法授权视频输入设备。
+      MEDIA_MATCHING_VIDEO_INPUT_UNAVAILABLE: 未发现 OBS Virtual Camera，请确认 OBS 虚拟摄像头已经启动。
+      MEDIA_VIDEO_INPUT_AUTHORIZATION_FAILED: OBS Virtual Camera 授权失败，请检查摄像头权限后重试。
+      MEDIA_AUDIO_OUTPUT_AUTHORIZATION_UNAVAILABLE: 当前 Electron 运行时无法授权非默认音频输出设备。
+      MEDIA_MATCHING_AUDIO_INPUT_UNAVAILABLE: 未发现 BlackHole 2ch 的输入端，无法授权同组输出。
+      MEDIA_AUDIO_OUTPUT_AUTHORIZATION_FAILED: BlackHole 2ch 输出授权失败，请检查麦克风权限后重试。
+      MEETING_MEDIA_NATIVE_HOST_UNAVAILABLE: 当前构建尚未提供原生会议媒体会话宿主。
+      MEETING_MEDIA_PREFLIGHT_FAILED: 无法完成原生会前检查。
+      MEETING_MEDIA_ROUTE_NOT_READY: 至少一条必需媒体路由尚未就绪。
+      MEETING_MEDIA_PROFILE_INVALID: 会议媒体配置无效。
+      MEETING_MEDIA_SERVICE_DISPOSED: 会议媒体服务已经关闭，请重启 AIRI。
+      MEETING_MEDIA_SESSION_ALREADY_ACTIVE: 已有会议媒体会话正在启动、运行或停止。
+      MEETING_MEDIA_SESSION_STALE: 该操作属于已经失效的会议媒体会话。
+      MEETING_MEDIA_MONITOR_DEVICE_REQUIRED: 请明确选择会议声音的物理监听设备。
+      MEETING_MEDIA_SPEECH_CONFIG_REQUIRED: 请完整填写 ASR Provider、模型和识别语言。
+      MEETING_MEDIA_COMPATIBILITY_PLATFORM_UNSUPPORTED: 兼容桥当前要求 macOS 13 或更高版本。
+      MEETING_MEDIA_OBS_NOT_INSTALLED: 系统或用户“应用程序”目录中未找到 OBS Studio。
+      MEETING_MEDIA_SCREEN_AUDIO_PERMISSION_REQUIRED: 请在 macOS 系统设置中授予 AIRI“屏幕与系统音频录制”权限。
+      MEETING_MEDIA_CAPTURE_SOURCE_REQUIRED: 请选择正在运行的会议应用窗口。
+      MEETING_MEDIA_CAPTURE_SOURCE_UNAVAILABLE: 所选会议窗口已经失效，请刷新后重新选择。
+      MEETING_MEDIA_BLACKHOLE_NOT_INSTALLED: 兼容桥会前检查未发现 BlackHole 2ch。
+      MEETING_MEDIA_AGENT_OUTPUT_DEVICE_REQUIRED: 请选择 BlackHole 2ch 作为 AIRI 的兼容桥音频输出。
+      MEETING_MEDIA_AGENT_OUTPUT_DEVICE_INVALID: AIRI 的兼容桥音频输出必须是 BlackHole 2ch。
+      MEETING_MEDIA_RENDERER_HOST_UNAVAILABLE: AIRI 主 Stage 窗口不可用，请重新打开后重试。
+      MEETING_MEDIA_RENDERER_HOST_START_FAILED: 主 Stage renderer 无法启动兼容桥。
+      MEETING_MEDIA_RENDERER_HOST_STOP_FAILED: renderer 清理兼容桥时发生错误。
+      MEETING_MEDIA_RENDERER_ROUTE_START_FAILED: 一条必需的兼容媒体路由无法启动。
+      MEETING_MEDIA_SPEECH_PIPELINE_FAILED: 会议 VAD 或 ASR 流水线失败。
+      MEETING_MEDIA_DIALOGUE_INGEST_FAILED: 识别出的会议发言无法送入 AIRI 对话链路。
+      MEETING_MEDIA_STAGE_FRAME_UNAVAILABLE: 当前 Stage 已停止提供画面。
+      MEETING_MEDIA_VIDEO_COMPOSITION_FAILED: 无法合成会议纯净输出画面。
+      MEETING_MEDIA_CAPTURE_STREAM_ENDED: 所选会议应用的音频捕获已经结束。
+      MEETING_MEDIA_AGENT_OUTPUT_FAILED: AIRI TTS 无法写入所选虚拟音频输出。
+      STAGE_FRAME_UNAVAILABLE: 当前角色渲染器没有可发布的完整画面。
+      STAGE_BACKGROUND_UNAVAILABLE: 当前 Stage 没有可用于不透明输出的背景。
+      MEETING_BACKGROUND_UNRESOLVED: 无法解析所选会议背景。
+      MEETING_BACKGROUND_LOAD_FAILED: 无法加载所选会议背景。
+      MEETING_BACKGROUND_COLOR_INVALID: 会议背景颜色无效。
+      MEETING_COMPOSITOR_CONTEXT_UNAVAILABLE: 无法创建会议画面合成器。
+      PCM_SESSION_STALE: 收到来自旧会话的音频帧。
+      PCM_SEQUENCE_DISCONTINUITY: 会议音频帧序号不连续。
+      PCM_FORMAT_INVALID: 会议音频格式不符合流水线契约。
+      PCM_INPUT_TOO_LARGE: 单次会议音频输入超过有界缓冲上限。
+      MEDIA_DEVICE_ENUMERATION_UNAVAILABLE: 当前环境不支持媒体设备枚举。
+      MEDIA_DEVICE_ENUMERATION_FAILED: 无法读取当前媒体设备列表。
   modules:
     mcp-server:
       description: 连接与管理 MCP 服务器和工具

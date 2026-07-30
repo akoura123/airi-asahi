@@ -7,6 +7,7 @@ import type { ServerChannel } from '../../services/airi/channel-server'
 import type { GodotStageManager } from '../../services/airi/godot-stage'
 import type { McpStdioManager } from '../../services/airi/mcp-servers'
 import type { AutoUpdater } from '../../services/electron/auto-updater'
+import type { MeetingMediaService } from '../../services/electron/meeting-media'
 import type { NoticeWindowManager } from '../notice'
 import type { OnboardingWindowManager } from '../onboarding'
 import type { SettingsWindowManager } from '../settings'
@@ -62,6 +63,7 @@ export async function setupMainWindow(params: {
   i18n: I18n
   onboardingWindowManager: OnboardingWindowManager
   windowAuthManager: WindowAuthManager
+  meetingMedia: MeetingMediaService
 }) {
   const {
     setup: setupConfig,
@@ -186,6 +188,7 @@ export async function setupMainWindow(params: {
     i18n: params.i18n,
     onboardingWindowManager: params.onboardingWindowManager,
     windowAuthManager: params.windowAuthManager,
+    meetingMedia: params.meetingMedia,
   })
 
   await load(window, baseUrl(resolve(getElectronMainDirname(), '..', 'renderer')))

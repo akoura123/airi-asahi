@@ -89,7 +89,7 @@ export interface StreamTranscriptionFileInputOptions extends Omit<XSAIStreamTran
 }
 
 export interface StreamTranscriptionStreamInputOptions extends Omit<XSAIStreamTranscriptionOptions, 'file' | 'fileName'> {
-  inputAudioStream: ReadableStream<ArrayBuffer>
+  inputAudioStream: ReadableStream<Uint8Array>
 }
 
 export type StreamTranscription = (options: WithUnknown<StreamTranscriptionFileInputOptions | StreamTranscriptionStreamInputOptions>) => StreamTranscriptionResult
@@ -102,11 +102,26 @@ export type HearingTranscriptionResult = HearingTranscriptionGenerateResult | He
 type HearingTranscriptionInput = File | {
   file?: File
   fileName?: string
-  inputAudioStream?: ReadableStream<ArrayBuffer>
+  inputAudioStream?: ReadableStream<Uint8Array>
 }
 
 interface HearingTranscriptionInvokeOptions {
   providerOptions?: Record<string, unknown>
+}
+
+/** Per-request overrides applied after the selected transcription provider's persisted options. */
+export interface RecordingTranscriptionOptions {
+  /** Provider options such as the meeting session's frozen recognition language. */
+  providerOptions?: Record<string, unknown>
+}
+
+/**
+ * Owns one streaming transcription request independently from later requests.
+ * Calling `finish` closes or aborts only this request and always returns the same completion.
+ */
+export interface HearingStreamingTranscriptionSession {
+  /** Closes the PCM input gracefully, or aborts the transport when `abort` is true. */
+  finish: (abort?: boolean) => Promise<string | undefined>
 }
 
 export const CONFIDENCE_THRESHOLD_DISABLED = -3
@@ -406,7 +421,7 @@ export const useHearingStore = defineStore('hearing-store', () => {
     const normalizedInput = (input instanceof File ? { file: input } : input ?? {}) as {
       file?: File
       fileName?: string
-      inputAudioStream?: ReadableStream<ArrayBuffer>
+      inputAudioStream?: ReadableStream<Uint8Array>
     }
     const features = providersStore.getTranscriptionFeatures(providerId)
     const streamExecutor = resolveStreamTranscriptionExecutor(providerId)
@@ -568,11 +583,16 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     trackVoiceInputCancelled,
     trackVoiceInputStarted,
   } = useAnalytics()
-  const streamingSession = shallowRef<{
+  interface StreamingAsrTrace {
+    span: Span
+    ended: boolean
+  }
+
+  interface ActiveStreamingTranscriptionSession {
     audioContext: AudioContext | Record<string, never>
     workletNode: AudioWorkletNode | Record<string, never>
     mediaStreamSource: MediaStreamAudioSourceNode | Record<string, never>
-    audioStreamController?: ReadableStreamDefaultController<ArrayBuffer>
+    audioStreamController?: ReadableStreamDefaultController<Uint8Array>
     abortController: AbortController
     result?: HearingTranscriptionResult & { recognition?: any }
     idleTimer?: ReturnType<typeof setTimeout>
@@ -581,26 +601,35 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
       onSentenceEnd?: (delta: string) => void
       onSpeechEnd?: (text: string) => void
     }
-  }>()
+    finish?: () => void
+    trace: StreamingAsrTrace
+    completion?: Promise<string | undefined>
+  }
 
-  let asrSpan: Span | undefined
+  const streamingSession = shallowRef<ActiveStreamingTranscriptionSession>()
+  let streamingStartupTail = Promise.resolve()
 
-  function startStreamingAsrSpan(providerId: string) {
+  function startStreamingAsrTrace(providerId: string): StreamingAsrTrace {
     activeTurnSpan.value?.end()
     const turnSpan = startSpan(IOSpanNames.InteractionTurn)
     activeTurnSpan.value = turnSpan
-    asrSpan = startSpan(IOSpanNames.SpeechRecognition, turnSpan, {
-      [IOAttributes.Subsystem]: IOSubsystems.ASR,
-      [IOAttributes.GenAIRequestModel]: providerId,
-    })
+    return {
+      span: startSpan(IOSpanNames.SpeechRecognition, turnSpan, {
+        [IOAttributes.Subsystem]: IOSubsystems.ASR,
+        [IOAttributes.GenAIRequestModel]: providerId,
+      }),
+      ended: false,
+    }
   }
 
-  function endStreamingAsrSpan() {
-    if (!asrSpan)
+  function endStreamingAsrTrace(trace: StreamingAsrTrace, text?: string) {
+    if (trace.ended)
       return
 
-    asrSpan.end()
-    asrSpan = undefined
+    if (text !== undefined)
+      trace.span.setAttribute(IOAttributes.ASRText, text)
+    trace.span.end()
+    trace.ended = true
   }
 
   const supportsStreamInput = computed(() => {
@@ -635,8 +664,8 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     await audioContext.audioWorklet.addModule(vadWorkletUrl)
     const workletNode = new AudioWorkletNode(audioContext, 'vad-audio-worklet-processor')
 
-    let audioStreamController: ReadableStreamDefaultController<ArrayBuffer> | undefined
-    const audioStream = new ReadableStream<ArrayBuffer>({
+    let audioStreamController: ReadableStreamDefaultController<Uint8Array> | undefined
+    const audioStream = new ReadableStream<Uint8Array>({
       start(controller) {
         audioStreamController = controller
       },
@@ -651,8 +680,11 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         return
 
       const pcm16 = float32ToInt16(buffer)
-      // Clone buffer to avoid retaining underlying ArrayBuffer references
-      audioStreamController.enqueue(pcm16.buffer.slice(0))
+      // Fetch request streams accept byte chunks. Clone the worklet-owned PCM
+      // buffer so Chromium can consume it after this message handler returns.
+      audioStreamController.enqueue(
+        new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength).slice(),
+      )
       onActivity?.()
     }
 
@@ -676,121 +708,132 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     }
   }
 
-  async function stopStreamingTranscription(abort?: boolean, disposeProviderId?: string) {
-    const session = streamingSession.value
-    if (!session)
-      return
+  function finishStreamingSession(
+    session: ActiveStreamingTranscriptionSession,
+    abort = false,
+    disposeProviderId?: string,
+  ): Promise<string | undefined> {
+    const reason = new DOMException(abort ? 'Aborted' : 'Stopped', 'AbortError')
 
-    if (asrSpan) {
-      asrSpan.setAttribute(IOAttributes.ASRAbort, !!abort)
-      asrSpan.end()
-      asrSpan = undefined
-    }
-
-    // Special handling for Web Speech API
-    if (session.providerId === 'browser-web-speech-api') {
-      try {
-        const reason = new DOMException(abort ? 'Aborted' : 'Stopped', 'AbortError')
-        if (!session.abortController.signal.aborted) {
-          session.abortController.abort(reason)
-        }
-
-        // Stop Web Speech API recognition if it exists
-        const result = session.result as any
-        if (result?.recognition) {
-          try {
-            result.recognition.stop()
-          }
-          catch (err) {
-            console.warn('Error stopping Web Speech API recognition:', err)
-          }
-        }
-      }
-      catch (err) {
-        console.error('Error stopping Web Speech API session:', err)
-      }
-
-      if (session.idleTimer)
-        clearTimeout(session.idleTimer)
-
-      streamingSession.value = undefined
-
-      if (session.result?.mode === 'stream') {
-        try {
-          const text = await session.result.text
-          return text
-        }
-        catch (err) {
-          if (isExpectedStreamStopError(err))
-            return
-
-          error.value = errorMessage(err)
-          console.error('Error getting transcription result:', error.value)
-        }
-      }
-
-      return
-    }
-
-    try {
-      const reason = new DOMException(abort ? 'Aborted' : 'Stopped', 'AbortError')
-      // Ensure provider transports (e.g., Aliyun NLS) are signaled to stop over websocket.
-      if (!session.abortController.signal.aborted) {
+    // A later abort is allowed to cancel a graceful finalization that is still waiting
+    // for the provider. This lets renderer teardown terminate every request it owns.
+    if (session.completion) {
+      if (abort && !session.abortController.signal.aborted)
         session.abortController.abort(reason)
-      }
-
-      if (abort)
-        session.audioStreamController?.error(reason)
-      else
-        session.audioStreamController?.close()
+      return session.completion
     }
-    catch {}
 
-    await tryCatch(() => {
-      session.mediaStreamSource.disconnect()
-      session.workletNode.port.onmessage = null
-      session.workletNode.disconnect()
-    })
-    await tryCatch(() => session.audioContext.close())
-
+    session.trace.span.setAttribute(IOAttributes.ASRAbort, abort)
     if (session.idleTimer)
       clearTimeout(session.idleTimer)
 
-    streamingSession.value = undefined
+    // Release global ownership before awaiting provider output. A new VAD segment may
+    // start while this request is still returning its final transcript.
+    if (streamingSession.value === session)
+      streamingSession.value = undefined
 
-    if (session.result?.mode === 'stream') {
-      try {
-        const text = await session.result.text
-
-        if (disposeProviderId) {
-          await providersStore.disposeProviderInstance(disposeProviderId)
+    let closeAudioContext = Promise.resolve()
+    try {
+      if (session.providerId === 'browser-web-speech-api') {
+        if (abort && !session.abortController.signal.aborted) {
+          session.abortController.abort(reason)
         }
+        else if (!abort) {
+          if (!session.finish)
+            throw new Error('Web Speech API streaming session does not expose graceful completion.')
+          session.finish()
+        }
+      }
+      else {
+        if (abort && !session.abortController.signal.aborted)
+          session.abortController.abort(reason)
 
+        // Closing PCM is the protocol-level end-of-segment signal. Aborting instead
+        // cancels the transport and intentionally discards its final transcript.
+        if (abort)
+          session.audioStreamController?.error(reason)
+        else
+          session.audioStreamController?.close()
+
+        session.mediaStreamSource.disconnect()
+        session.workletNode.port.onmessage = null
+        session.workletNode.disconnect()
+        closeAudioContext = (async () => {
+          await tryCatch(() => session.audioContext.close())
+        })()
+      }
+    }
+    catch (err) {
+      if (!isExpectedStreamStopError(err))
+        console.error('Error stopping streaming transcription session:', err)
+    }
+
+    session.completion = (async () => {
+      await closeAudioContext
+
+      try {
+        const text = session.result?.mode === 'stream'
+          ? await session.result.text
+          : session.result?.text
+        endStreamingAsrTrace(session.trace, text)
         return text
       }
       catch (err) {
+        endStreamingAsrTrace(session.trace)
         if (isExpectedStreamStopError(err))
           return
 
         error.value = errorMessage(err)
         console.error('Error generating transcription:', error.value)
       }
-    }
+      finally {
+        if (disposeProviderId)
+          await providersStore.disposeProviderInstance(disposeProviderId)
+      }
+    })()
 
-    const text = session.result?.text
-    if (disposeProviderId)
-      await providersStore.disposeProviderInstance(disposeProviderId)
-
-    return text
+    return session.completion
   }
 
-  async function transcribeForMediaStream(stream: MediaStream, options?: {
+  function handleForStreamingSession(session: ActiveStreamingTranscriptionSession): HearingStreamingTranscriptionSession {
+    return {
+      finish: abort => finishStreamingSession(session, abort),
+    }
+  }
+
+  function resetStreamingIdleTimer(session: ActiveStreamingTranscriptionSession, idleTimeoutMs: number): void {
+    if (session.idleTimer)
+      clearTimeout(session.idleTimer)
+    if (idleTimeoutMs <= 0) {
+      session.idleTimer = undefined
+      return
+    }
+
+    session.idleTimer = setTimeout(() => {
+      void finishStreamingSession(session, false, session.providerId)
+    }, idleTimeoutMs)
+  }
+
+  function stopStreamingTranscription(abort?: boolean, disposeProviderId?: string) {
+    const session = streamingSession.value
+    if (!session)
+      return Promise.resolve(undefined)
+
+    return finishStreamingSession(session, abort, disposeProviderId)
+  }
+
+  interface MediaStreamTranscriptionOptions {
     sampleRate?: number
     providerOptions?: Record<string, unknown>
     idleTimeoutMs?: number
     onSentenceEnd?: (delta: string) => void
     onSpeechEnd?: (text: string) => void
-  }) {
+  }
+
+  async function startStreamingTranscriptionSession(
+    stream: MediaStream,
+    options?: MediaStreamTranscriptionOptions,
+  ): Promise<HearingStreamingTranscriptionSession | undefined> {
     console.info('[Hearing Pipeline] transcribeForMediaStream called', {
       supportsStreamInput: supportsStreamInput.value,
       hasStream: !!stream,
@@ -804,6 +847,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     }
 
     error.value = undefined
+    let startupTrace: StreamingAsrTrace | undefined
 
     try {
       const providerId = activeTranscriptionProvider.value
@@ -843,26 +887,19 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
           if (hasNewCallbacks) {
             console.info('Web Speech API: New callbacks provided, restarting session to use them')
-            await stopStreamingTranscription(false, existingSession.providerId)
-            // Continue to create new session below
-            // Note: stopStreamingTranscription already clears streamingSession.value and waits for async cleanup
+            void finishStreamingSession(existingSession, false)
           }
           else {
-            // No new callbacks - just bump idle timer and reuse existing session
             const idleTimeout = options?.idleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT
-            if (existingSession.idleTimer) {
-              clearTimeout(existingSession.idleTimer)
-              existingSession.idleTimer = setTimeout(async () => {
-                await stopStreamingTranscription(false, existingSession.providerId)
-              }, idleTimeout)
-            }
+            resetStreamingIdleTimer(existingSession, idleTimeout)
 
             console.info('Web Speech API session already active, reusing existing session (no callback changes)')
-            return
+            return handleForStreamingSession(existingSession)
           }
         }
 
-        startStreamingAsrSpan(providerId)
+        const trace = startStreamingAsrTrace(providerId)
+        startupTrace = trace
 
         // Auto-select default model if not selected
         if (!activeTranscriptionModel.value) {
@@ -890,15 +927,10 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         // Web Speech API in continuous mode should run indefinitely - no idle timeout
         // Only stop when explicitly requested (e.g., microphone disabled)
         const idleTimeout = options?.idleTimeoutMs ?? 0 // 0 = disabled
-        let idleTimer: ReturnType<typeof setTimeout> | undefined
+        let ownedSession: ActiveStreamingTranscriptionSession | undefined
         const bumpIdle = () => {
-          if (idleTimeout > 0) {
-            if (idleTimer)
-              clearTimeout(idleTimer)
-            idleTimer = setTimeout(async () => {
-              await stopStreamingTranscription(false, providerId)
-            }, idleTimeout)
-          }
+          if (ownedSession)
+            resetStreamingIdleTimer(ownedSession, idleTimeout)
         }
 
         const result = streamWebSpeechAPITranscription(stream, {
@@ -909,38 +941,37 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
           abortSignal: abortController.signal,
           onSentenceEnd: (delta) => {
             bumpIdle() // Bump idle timer on activity (only if enabled)
-            if (asrSpan)
-              asrSpan.addEvent(IOEvents.ASRSentenceEnd, { [IOAttributes.ASRText]: delta })
+            if (!trace.ended)
+              trace.span.addEvent(IOEvents.ASRSentenceEnd, { [IOAttributes.ASRText]: delta })
             // Call the options callback
             options?.onSentenceEnd?.(delta)
           },
           onSpeechEnd: (text) => {
-            if (asrSpan) {
-              asrSpan.setAttribute(IOAttributes.ASRText, text)
-              asrSpan.end()
-              asrSpan = undefined
-            }
+            endStreamingAsrTrace(trace, text)
             // Call the options callback
             options?.onSpeechEnd?.(text)
           },
         })
 
         // Store session info for cleanup
-        const recognitionInstance = (result as any).recognition
-        streamingSession.value = {
+        const activeSession: ActiveStreamingTranscriptionSession = {
           audioContext: {} as AudioContext, // Not used for Web Speech API
           workletNode: {} as AudioWorkletNode, // Not used for Web Speech API
           mediaStreamSource: {} as MediaStreamAudioSourceNode, // Not used for Web Speech API
           audioStreamController: undefined,
           abortController,
-          result: { ...result, mode: 'stream' as const, recognition: recognitionInstance },
-          idleTimer,
+          result: { ...result, mode: 'stream' as const, recognition: result.recognition },
           providerId,
+          finish: result.finish,
           callbacks: {
             onSentenceEnd: options?.onSentenceEnd,
             onSpeechEnd: options?.onSpeechEnd,
           },
-        } as any // Type assertion needed because recognition is extra
+          trace,
+        }
+        ownedSession = activeSession
+        streamingSession.value = activeSession
+        startupTrace = undefined
 
         // Initial idle timer (only if enabled)
         bumpIdle()
@@ -968,7 +999,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
           })()
         }
 
-        return
+        return handleForStreamingSession(activeSession)
       }
 
       const provider = await providersStore.getProviderInstance<TranscriptionProviderWithExtraOptions<string, any>>(providerId)
@@ -990,50 +1021,40 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
         if (hasNewCallbacks) {
           console.info('[Hearing Pipeline] New callbacks provided, restarting session')
-          await stopStreamingTranscription(false, existingSession.providerId)
-          // Fall through to create a new session with updated callbacks
+          // Detaching is synchronous; the prior provider response may finish in parallel.
+          void finishStreamingSession(existingSession, false)
         }
         else {
-          // No callback changes: refresh idle timer and reuse session
-          if (existingSession.idleTimer) {
-            clearTimeout(existingSession.idleTimer)
-            existingSession.idleTimer = setTimeout(async () => {
-              await stopStreamingTranscription(false, existingSession.providerId)
-            }, idleTimeout)
-          }
-          return
+          resetStreamingIdleTimer(existingSession, idleTimeout)
+          return handleForStreamingSession(existingSession)
         }
       }
 
-      startStreamingAsrSpan(providerId)
+      const trace = startStreamingAsrTrace(providerId)
+      startupTrace = trace
 
       const abortController = new AbortController()
-      let idleTimer: ReturnType<typeof setTimeout> | undefined
+      let ownedSession: ActiveStreamingTranscriptionSession | undefined
       const bumpIdle = () => {
-        if (idleTimer)
-          clearTimeout(idleTimer)
-        idleTimer = setTimeout(async () => {
-          await stopStreamingTranscription(false, providerId)
-        }, idleTimeout)
+        if (ownedSession)
+          resetStreamingIdleTimer(ownedSession, idleTimeout)
       }
 
-      const session = await createAudioStreamFromMediaStream(
+      const audioSession = await createAudioStreamFromMediaStream(
         stream,
         options?.sampleRate ?? DEFAULT_SAMPLE_RATE,
         () => bumpIdle(),
       )
 
-      if (session.audioContext.state === 'suspended')
-        await session.audioContext.resume()
-
-      bumpIdle()
+      if (audioSession.audioContext.state === 'suspended')
+        await audioSession.audioContext.resume()
 
       const model = activeTranscriptionModel.value
       const result = await hearingStore.transcription(
         providerId,
         provider,
         model,
-        { inputAudioStream: session.audioStream },
+        { inputAudioStream: audioSession.audioStream },
         undefined,
         {
           providerOptions: {
@@ -1043,32 +1064,28 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         },
       )
 
-      streamingSession.value = {
-        audioContext: session.audioContext,
-        workletNode: session.workletNode,
-        mediaStreamSource: session.mediaStreamSource,
-        audioStreamController: session.controller,
+      const activeSession: ActiveStreamingTranscriptionSession = {
+        audioContext: audioSession.audioContext,
+        workletNode: audioSession.workletNode,
+        mediaStreamSource: audioSession.mediaStreamSource,
+        audioStreamController: audioSession.controller,
         abortController,
         result,
-        idleTimer,
         providerId,
         callbacks: {
           onSentenceEnd: options?.onSentenceEnd,
           onSpeechEnd: options?.onSpeechEnd,
         },
+        trace,
       }
+      ownedSession = activeSession
+      streamingSession.value = activeSession
+      startupTrace = undefined
+      bumpIdle()
 
       // Stream out text deltas to caller without tearing down the session.
       if (result.mode === 'stream' && result.textStream) {
         void (async () => {
-          // Capture callbacks from the session at the time the reader is created
-          // This prevents cross-session leakage if the session is restarted before
-          // this reader finishes (e.g., when navigating between pages or callbacks change)
-          const sessionCallbacks = {
-            onSentenceEnd: streamingSession.value?.callbacks?.onSentenceEnd,
-            onSpeechEnd: streamingSession.value?.callbacks?.onSpeechEnd,
-          }
-
           let fullText = ''
           try {
             const reader = result.textStream.getReader()
@@ -1079,10 +1096,9 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
                 break
               if (value) {
                 fullText += value
-                if (asrSpan)
-                  asrSpan.addEvent(IOEvents.ASRSentenceEnd, { [IOAttributes.ASRText]: value })
-                // Use captured callbacks to avoid cross-session leakage
-                sessionCallbacks.onSentenceEnd?.(value)
+                if (!trace.ended)
+                  trace.span.addEvent(IOEvents.ASRSentenceEnd, { [IOAttributes.ASRText]: value })
+                activeSession.callbacks?.onSentenceEnd?.(value)
               }
             }
           }
@@ -1091,19 +1107,17 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
               console.error('Error reading text stream:', err)
           }
           finally {
-            if (asrSpan) {
-              asrSpan.setAttribute(IOAttributes.ASRText, fullText)
-              asrSpan.end()
-              asrSpan = undefined
-            }
-            // Use captured callbacks to avoid cross-session leakage
-            sessionCallbacks.onSpeechEnd?.(fullText)
+            endStreamingAsrTrace(trace, fullText)
+            activeSession.callbacks?.onSpeechEnd?.(fullText)
           }
         })()
       }
+
+      return handleForStreamingSession(activeSession)
     }
     catch (err) {
-      endStreamingAsrSpan()
+      if (startupTrace)
+        endStreamingAsrTrace(startupTrace)
 
       if (isExpectedStreamStopError(err))
         return
@@ -1113,7 +1127,29 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     }
   }
 
-  async function transcribeForRecording(recording: Blob | null | undefined) {
+  async function transcribeForMediaStream(
+    stream: MediaStream,
+    options?: MediaStreamTranscriptionOptions,
+  ): Promise<HearingStreamingTranscriptionSession | undefined> {
+    const previousStartup = streamingStartupTail
+    let releaseStartup: () => void = () => undefined
+    streamingStartupTail = new Promise<void>((resolve) => {
+      releaseStartup = resolve
+    })
+
+    await previousStartup
+    try {
+      return await startStreamingTranscriptionSession(stream, options)
+    }
+    finally {
+      releaseStartup()
+    }
+  }
+
+  async function transcribeForRecording(
+    recording: Blob | null | undefined,
+    options: RecordingTranscriptionOptions = {},
+  ) {
     error.value = undefined
 
     if (!recording) {
@@ -1147,7 +1183,10 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
       const providerConfig = providersStore.getProviderConfig(providerId)
       const model = resolveActiveTranscriptionModel(activeTranscriptionModel.value, providerConfig)
-      const providerOptions = resolveTranscriptionProviderOptions(providerConfig)
+      const providerOptions = {
+        ...resolveTranscriptionProviderOptions(providerConfig),
+        ...options.providerOptions,
+      }
       console.info('[Hearing Pipeline] Transcribing recording', {
         providerId,
         language: providerOptions.language,

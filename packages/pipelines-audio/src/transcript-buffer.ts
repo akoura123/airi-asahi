@@ -27,7 +27,7 @@ const CJK_START_RE = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{S
  * - `"你好世界"`
  * - `"hello world"`
  */
-function joinTranscriptFragments(previous: string, next: string) {
+export function joinTranscriptFragments(previous: string, next: string) {
   if (!previous)
     return next
 

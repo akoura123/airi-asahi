@@ -94,6 +94,20 @@ export interface GetLoopbackAudioMediaStreamOptions {
 let setSourceMutex: MutexInterface
 let screenCaptureSourceMutexHandle: string | undefined
 let setSourceMutexTimeoutHandle: NodeJS.Timeout | undefined
+let pendingDisplayMediaWebContentsId: number | undefined
+
+/**
+ * Reports whether the WebContents owns the active exact-source capture reservation.
+ *
+ * The reservation exists only between `setSource` and its matching reset or timeout.
+ * Electron permission handlers use this fact to correlate an otherwise untyped media
+ * request with the source already selected by the same AIRI renderer.
+ *
+ * @param webContentsId Electron WebContents identifier requesting media access.
+ */
+export function hasPendingDisplayMediaRequest(webContentsId: number): boolean {
+  return pendingDisplayMediaWebContentsId === webContentsId
+}
 
 export function initScreenCaptureForMain(options: InitMainOptions = {}): void {
   const {
@@ -142,6 +156,7 @@ function resetScreenCaptureSource() {
   clearTimeout(setSourceMutexTimeoutHandle)
   setSourceMutexTimeoutHandle = undefined
   screenCaptureSourceMutexHandle = undefined
+  pendingDisplayMediaWebContentsId = undefined
 }
 
 const initializedWindows = new WeakSet<BrowserWindow>()
@@ -217,6 +232,7 @@ export function initScreenCaptureForWindow(window: BrowserWindow, options?: Init
     const handle = nanoid()
     setSourceMutexTimeoutHandle = undefined
     screenCaptureSourceMutexHandle = handle
+    pendingDisplayMediaWebContentsId = window.webContents.id
 
     try {
       session.setDisplayMediaRequestHandler(async (_request, callback) => {
