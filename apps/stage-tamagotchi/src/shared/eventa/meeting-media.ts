@@ -1,9 +1,12 @@
 import type {
   MeetingMediaCommandResult,
   MeetingMediaError,
+  MeetingMediaPcmChunk,
   MeetingMediaPreflight,
   MeetingMediaProfile,
   MeetingMediaRendererMetricsUpdate,
+  MeetingMediaRendererPreflightRequest,
+  MeetingMediaRendererPreflightResult,
   MeetingMediaRendererStartRequest,
   MeetingMediaRendererStartResult,
   MeetingMediaRendererStopRequest,
@@ -27,6 +30,8 @@ export const electronMeetingMediaStart = defineInvokeEventa<MeetingMediaCommandR
 export const electronMeetingMediaStop = defineInvokeEventa<MeetingMediaCommandResult, ElectronMeetingMediaStopPayload>('eventa:invoke:electron:meeting-media:stop')
 export const electronMeetingMediaGetRuntime = defineInvokeEventa<MeetingMediaRuntime>('eventa:invoke:electron:meeting-media:get-runtime')
 export const electronMeetingMediaRuntimeChanged = defineEventa<MeetingMediaRuntime>('eventa:event:electron:meeting-media:runtime-changed')
+export const electronMeetingMediaPcmChunk = defineEventa<MeetingMediaPcmChunk>('eventa:event:electron:meeting-media:pcm-chunk')
+export const electronMeetingMediaRendererPreflight = defineInvokeEventa<MeetingMediaRendererPreflightResult, MeetingMediaRendererPreflightRequest>('eventa:invoke:electron:meeting-media:renderer:preflight')
 export const electronMeetingMediaRendererStart = defineInvokeEventa<MeetingMediaRendererStartResult, MeetingMediaRendererStartRequest>('eventa:invoke:electron:meeting-media:renderer:start')
 export const electronMeetingMediaRendererStop = defineInvokeEventa<void, MeetingMediaRendererStopRequest>('eventa:invoke:electron:meeting-media:renderer:stop')
 export const electronMeetingMediaRendererRouteFailed = defineEventa<MeetingMediaError>('eventa:event:electron:meeting-media:renderer:route-failed')

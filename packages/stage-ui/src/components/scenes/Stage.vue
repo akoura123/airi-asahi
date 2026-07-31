@@ -40,7 +40,7 @@ import { getDefaultStreamingModel, getDefinedProvider } from '../../libs/provide
 import { OFFICIAL_SPEECH_PROVIDER_ID, OFFICIAL_SPEECH_STREAMING_PROVIDER_ID } from '../../libs/providers/providers/official'
 import { bindSpeakingStateToPlaybackManager } from '../../libs/speech/playback-speaking-state'
 import { createStageTtsSession } from '../../libs/speech/tts-session'
-import { routeMeetingAgentAudioSource } from '../../services/meeting-audio'
+import { reportMeetingAgentAudioFailure, routeMeetingAgentAudioSource } from '../../services/meeting-audio'
 import { registerMeetingStageFrameSource } from '../../services/meeting-video'
 import { getSpeechBusContext, speechOutputGetPlaybackState } from '../../services/speech/bus'
 import { useAudioContext, useSpeakingStore } from '../../stores/audio'
@@ -312,15 +312,18 @@ async function playSpecialToken(
 const lipSyncNode = ref<AudioNode>()
 
 async function playFunction(item: Parameters<Parameters<typeof createPlaybackManager<AudioBuffer>>[0]['play']>[0], signal: AbortSignal): Promise<void> {
-  if (!audioContext || !item.audio)
+  if (!audioContext || !item.audio) {
+    reportMeetingAgentAudioFailure(new Error('The AIRI audio playback context or decoded speech buffer is unavailable.'))
     return
+  }
 
   // Ensure audio context is resumed (browsers suspend it by default until user interaction)
   if (audioContext.state === 'suspended') {
     try {
       await audioContext.resume()
     }
-    catch {
+    catch (error) {
+      reportMeetingAgentAudioFailure(error)
       return
     }
   }
@@ -383,7 +386,8 @@ async function playFunction(item: Parameters<Parameters<typeof createPlaybackMan
           trackOfficialAutoTtsForTurn(model)
       }
     }
-    catch {
+    catch (error) {
+      reportMeetingAgentAudioFailure(error)
       stopPlayback()
     }
   })
@@ -427,14 +431,20 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
     if (signal.aborted)
       return null
 
-    if (speechMuted.value)
+    if (speechMuted.value) {
+      reportMeetingAgentAudioFailure(new Error('AIRI speech output is muted.'))
       return null
+    }
 
-    if (activeSpeechProvider.value === 'speech-noop')
+    if (activeSpeechProvider.value === 'speech-noop') {
+      reportMeetingAgentAudioFailure(new Error('No active TTS provider is configured.'))
       return null
+    }
 
-    if (!activeSpeechProvider.value)
+    if (!activeSpeechProvider.value) {
+      reportMeetingAgentAudioFailure(new Error('No active TTS provider is selected.'))
       return null
+    }
 
     // Streaming provider must NEVER reach this per-segment callback. The
     // streaming code path opens its own ws at `onBeforeMessageComposed`
@@ -445,17 +455,28 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
     // segment — exactly the behavior the refactor is meant to delete.
     // Codex review MEDIUM #3: refuse loudly instead.
     if (resolveSpeechTransport(activeSpeechProvider.value) === 'bidirectional-ws') {
+      const error = new Error('The streaming TTS session was not opened before synthesis started.')
       console.warn('[Speech Pipeline] bidirectional-ws provider reached per-segment fallback', {
         reason: 'streaming session was not opened at intent start (voice unset?)',
         provider: activeSpeechProvider.value,
         segment: request.text?.slice(0, 40),
       })
+      reportMeetingAgentAudioFailure(error)
       return null
     }
 
-    const provider = await providersStore.getProviderInstance(activeSpeechProvider.value) as SpeechProviderWithExtraOptions<string, UnElevenLabsOptions>
+    let provider: SpeechProviderWithExtraOptions<string, UnElevenLabsOptions> | undefined
+    try {
+      provider = await providersStore.getProviderInstance(activeSpeechProvider.value) as SpeechProviderWithExtraOptions<string, UnElevenLabsOptions> | undefined
+    }
+    catch (error) {
+      console.error('Failed to initialize speech provider', error)
+      reportMeetingAgentAudioFailure(error)
+      return null
+    }
     if (!provider) {
       console.error('Failed to initialize speech provider')
+      reportMeetingAgentAudioFailure(new Error(`Failed to initialize TTS provider "${activeSpeechProvider.value}".`))
       return null
     }
 
@@ -506,8 +527,10 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
       }
     }
 
-    if (!model || !voice)
+    if (!model || !voice) {
+      reportMeetingAgentAudioFailure(new Error('The active TTS model or voice is not configured.'))
       return null
+    }
 
     try {
       const speechRequest = speechStore.resolveSpeechInput({
@@ -543,8 +566,12 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
         voice: voice.id,
       })
 
-      if (signal.aborted || !res || res.byteLength === 0)
+      if (signal.aborted)
         return null
+      if (!res || res.byteLength === 0) {
+        reportMeetingAgentAudioFailure(new Error('The TTS provider returned empty audio.'))
+        return null
+      }
 
       const audioBuffer = await audioContext.decodeAudioData(res)
       trackOfficialAutoTtsForTurn(model)
@@ -563,6 +590,7 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
           voice: voice?.id,
           error: err,
         })
+        reportMeetingAgentAudioFailure(err)
       }
       return null
     }
@@ -812,6 +840,7 @@ function openTtsSession(turnId: string): StageTtsSession {
           model: activeSpeechModel.value,
           error: err,
         })
+        reportMeetingAgentAudioFailure(err)
         // Drop the failed session so no further audio is queued, but let the
         // playback manager keep draining already-queued audio and emit its own
         // terminal events. Calling resetSpeakingState() here would force the

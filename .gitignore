@@ -143,3 +143,5 @@ apps/stage-tamagotchi/electron.vite.config.*.mjs
 
 docs/ai/context/verifications/
 .playwright-mcp/
+# Generated ScreenCaptureKit helper; build it from the tracked Swift source.
+apps/stage-tamagotchi/native/meeting-media/bin/

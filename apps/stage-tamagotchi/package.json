@@ -14,6 +14,9 @@
   "scripts": {
     "lint": "eslint --cache .",
     "typecheck": "vue-tsc --noEmit",
+    "build:meeting-audio:mac": "tsx scripts/build-macos-meeting-audio-capture.ts",
+    "predev": "pnpm run build:meeting-audio:mac",
+    "prebuild": "pnpm run build:meeting-audio:mac",
     "app:dev": "pnpm run dev",
     "app:build": "pnpm run build",
     "start": "electron-vite preview",

@@ -135,6 +135,13 @@ export default {
     runAfterFinish: true,
   },
   mac: {
+    extraResources: [
+      {
+        from: 'native/meeting-media/bin/darwin-${arch}',
+        to: 'meeting-media/bin',
+        filter: ['airi-meeting-audio-capture'],
+      },
+    ],
     entitlementsInherit: 'build/entitlements.mac.plist',
     // NOTICE: Same channel rule as Windows. Keep `${arch}` here so generated metadata resolves
     // to architecture-specific update feeds on macOS (for example: `latest-x64-mac.yml`, `latest-arm64-mac.yml`).

@@ -70,6 +70,15 @@ export function stopMeetingAgentAudioOutput(sessionId: string): void {
   activeOutput = null
 }
 
+/** Reports a synthesis or playback failure only when a meeting output currently owns the speech route. */
+export function reportMeetingAgentAudioFailure(error: unknown): void {
+  const runtime = activeOutput
+  if (!runtime)
+    return
+
+  runtime.onFailure(error instanceof Error ? error : new Error(String(error)))
+}
+
 async function ensureSink(runtime: MeetingAgentAudioOutputRuntime, context: AudioContext) {
   if (runtime.sink?.context === context)
     return runtime.sink

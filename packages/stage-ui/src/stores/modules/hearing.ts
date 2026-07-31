@@ -109,10 +109,36 @@ interface HearingTranscriptionInvokeOptions {
   providerOptions?: Record<string, unknown>
 }
 
+/** Identifies the transcription runtime selected for one request or frozen session. */
+export interface HearingTranscriptionSelection {
+  /** Provider registry ID that owns the transcription request. */
+  providerId: string
+  /** Provider model ID sent with the transcription request. */
+  model: string
+}
+
 /** Per-request overrides applied after the selected transcription provider's persisted options. */
 export interface RecordingTranscriptionOptions {
+  /** Explicit request owner; when omitted, the current Hearing selection is used. */
+  selection?: HearingTranscriptionSelection
   /** Provider options such as the meeting session's frozen recognition language. */
   providerOptions?: Record<string, unknown>
+}
+
+/** Per-request controls for transcription from a caller-owned media stream. */
+export interface MediaStreamTranscriptionOptions {
+  /** Explicit request owner; when omitted, the current Hearing selection is used. */
+  selection?: HearingTranscriptionSelection
+  /** PCM sample rate produced for providers that accept caller-owned streams. @default 16000 */
+  sampleRate?: number
+  /** Provider-specific request options merged after persisted provider configuration. */
+  providerOptions?: Record<string, unknown>
+  /** Inactivity timeout in milliseconds; `0` disables automatic closure. @default 15000 */
+  idleTimeoutMs?: number
+  /** Receives each final sentence fragment emitted before stream completion. */
+  onSentenceEnd?: (delta: string) => void
+  /** Receives the complete recognized text when the provider stream closes. */
+  onSpeechEnd?: (text: string) => void
 }
 
 /**
@@ -634,20 +660,37 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
   const supportsStreamInput = computed(() => {
     const providerId = activeTranscriptionProvider.value
+    return providerSupportsStreamInput(providerId)
+  })
+
+  const DEFAULT_SAMPLE_RATE = 16000
+  const DEFAULT_STREAM_IDLE_TIMEOUT = 15000
+
+  function providerSupportsStreamInput(providerId: string): boolean {
     if (!providerId)
       return false
 
-    // Web Speech API always supports stream input when available
+    // Web Speech API is a browser-owned microphone source rather than a provider that accepts
+    // caller-supplied PCM. Preserve its existing Hearing behavior while meeting preflight rejects it.
     if (providerId === 'browser-web-speech-api') {
       return typeof window !== 'undefined'
         && ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)
     }
 
     return providersStore.getTranscriptionFeatures(providerId).supportsStreamInput
-  })
+  }
 
-  const DEFAULT_SAMPLE_RATE = 16000
-  const DEFAULT_STREAM_IDLE_TIMEOUT = 15000
+  function resolveTranscriptionRequest(selection?: HearingTranscriptionSelection) {
+    const providerId = selection
+      ? selection.providerId.trim()
+      : activeTranscriptionProvider.value
+    const providerConfig = providersStore.getProviderConfig(providerId)
+    const model = selection
+      ? selection.model.trim()
+      : resolveActiveTranscriptionModel(activeTranscriptionModel.value, providerConfig)
+
+    return { providerId, providerConfig, model }
+  }
 
   function float32ToInt16(buffer: Float32Array) {
     const output = new Int16Array(buffer.length)
@@ -822,26 +865,19 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     return finishStreamingSession(session, abort, disposeProviderId)
   }
 
-  interface MediaStreamTranscriptionOptions {
-    sampleRate?: number
-    providerOptions?: Record<string, unknown>
-    idleTimeoutMs?: number
-    onSentenceEnd?: (delta: string) => void
-    onSpeechEnd?: (text: string) => void
-  }
-
   async function startStreamingTranscriptionSession(
     stream: MediaStream,
     options?: MediaStreamTranscriptionOptions,
   ): Promise<HearingStreamingTranscriptionSession | undefined> {
+    const request = resolveTranscriptionRequest(options?.selection)
     console.info('[Hearing Pipeline] transcribeForMediaStream called', {
-      supportsStreamInput: supportsStreamInput.value,
+      supportsStreamInput: providerSupportsStreamInput(request.providerId),
       hasStream: !!stream,
-      providerId: activeTranscriptionProvider.value,
+      providerId: request.providerId,
       hasCallbacks: !!(options?.onSentenceEnd || options?.onSpeechEnd),
     })
 
-    if (!supportsStreamInput.value) {
+    if (!providerSupportsStreamInput(request.providerId)) {
       console.warn('[Hearing Pipeline] Stream input not supported')
       return
     }
@@ -850,7 +886,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     let startupTrace: StreamingAsrTrace | undefined
 
     try {
-      const providerId = activeTranscriptionProvider.value
+      const { model, providerConfig, providerId } = request
       const providerError = resolveActiveTranscriptionProviderError(providerId)
       if (providerError) {
         error.value = providerError
@@ -902,7 +938,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         startupTrace = trace
 
         // Auto-select default model if not selected
-        if (!activeTranscriptionModel.value) {
+        if (!options?.selection && !activeTranscriptionModel.value) {
           // Try to get models for the provider and select the first one
           const models = await providersStore.getModelsForProvider(providerId)
           if (models.length > 0) {
@@ -919,9 +955,8 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         const abortController = new AbortController()
 
         // Get provider config for language settings
-        const providerConfig = providersStore.getProviderConfig(providerId) || {}
         const language = (options?.providerOptions?.language as string)
-          || (providerConfig.language as string)
+          || (providerConfig?.language as string)
           || 'en-US'
 
         // Web Speech API in continuous mode should run indefinitely - no idle timeout
@@ -935,9 +970,9 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
         const result = streamWebSpeechAPITranscription(stream, {
           language,
-          continuous: (options?.providerOptions?.continuous as boolean) ?? (providerConfig.continuous as boolean) ?? true,
-          interimResults: (options?.providerOptions?.interimResults as boolean) ?? (providerConfig.interimResults as boolean) ?? true,
-          maxAlternatives: (options?.providerOptions?.maxAlternatives as number) ?? (providerConfig.maxAlternatives as number) ?? 1,
+          continuous: (options?.providerOptions?.continuous as boolean) ?? (providerConfig?.continuous as boolean) ?? true,
+          interimResults: (options?.providerOptions?.interimResults as boolean) ?? (providerConfig?.interimResults as boolean) ?? true,
+          maxAlternatives: (options?.providerOptions?.maxAlternatives as number) ?? (providerConfig?.maxAlternatives as number) ?? 1,
           abortSignal: abortController.signal,
           onSentenceEnd: (delta) => {
             bumpIdle() // Bump idle timer on activity (only if enabled)
@@ -1049,7 +1084,6 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
       if (audioSession.audioContext.state === 'suspended')
         await audioSession.audioContext.resume()
 
-      const model = activeTranscriptionModel.value
       const result = await hearingStore.transcription(
         providerId,
         provider,
@@ -1149,26 +1183,27 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
   async function transcribeForRecording(
     recording: Blob | null | undefined,
     options: RecordingTranscriptionOptions = {},
-  ) {
+  ): Promise<string | undefined> {
     error.value = undefined
+    const request = resolveTranscriptionRequest(options.selection)
 
     if (!recording) {
       error.value = 'No recording captured from microphone'
-      trackVoiceInputCancelled({ stt_provider_id: activeTranscriptionProvider.value || 'unknown' })
+      trackVoiceInputCancelled({ stt_provider_id: request.providerId || 'unknown' })
       return
     }
 
     if (recording.size <= 0) {
       error.value = 'Recording captured from microphone is empty'
       trackAudioDeviceUnavailable({
-        stt_provider_id: activeTranscriptionProvider.value || 'unknown',
+        stt_provider_id: request.providerId || 'unknown',
         error_code: 'device_unavailable',
       })
       return
     }
 
     try {
-      const providerId = activeTranscriptionProvider.value
+      const { model, providerConfig, providerId } = request
       const providerError = resolveActiveTranscriptionProviderError(providerId)
       if (providerError) {
         error.value = providerError
@@ -1181,8 +1216,6 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         throw new Error('Failed to initialize speech provider')
       }
 
-      const providerConfig = providersStore.getProviderConfig(providerId)
-      const model = resolveActiveTranscriptionModel(activeTranscriptionModel.value, providerConfig)
       const providerOptions = {
         ...resolveTranscriptionProviderOptions(providerConfig),
         ...options.providerOptions,
@@ -1203,13 +1236,11 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         { providerOptions },
       )
       const text = result.mode === 'stream' ? await result.text : result.text
-      if (!text || !text.trim()) {
-        const responseSummary = result.mode === 'generate'
-          ? describeEmptyTranscriptionResponse(result)
-          : 'stream result returned empty text'
-        error.value = `No transcription result returned from provider (${responseSummary})`
-        return
-      }
+      // A provider may successfully recognize no speech after VAD captures noise, music, or an
+      // incomplete utterance. This completes the segment without creating a dialogue turn; only
+      // transport, protocol, or provider exceptions fail the hearing pipeline.
+      if (!text || !text.trim())
+        return ''
 
       return text
     }

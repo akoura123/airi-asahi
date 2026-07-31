@@ -258,6 +258,18 @@ export interface MeetingMediaRendererStartRequest {
   profile: MeetingMediaProfile
 }
 
+/** Main-to-renderer readiness probe for profile-owned processing such as VAD and ASR. */
+export interface MeetingMediaRendererPreflightRequest {
+  profile: MeetingMediaProfile
+  /** Present during start so a rejected profile remains correlated with its process session. */
+  sessionId?: string
+}
+
+/** Renderer readiness result produced without allocating meeting media resources. */
+export type MeetingMediaRendererPreflightResult
+  = | { ready: true }
+    | { ready: false, error: MeetingMediaError }
+
 /** Renderer allocation acknowledgement used before Main may publish `running`. */
 export type MeetingMediaRendererStartResult
   = | { ready: true, devices: MeetingMediaDevice[] }

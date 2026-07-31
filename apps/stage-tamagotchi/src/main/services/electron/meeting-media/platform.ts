@@ -20,6 +20,8 @@ import { MEETING_MEDIA_COMPATIBILITY_NAMES, MEETING_MEDIA_PROTOCOL_VERSION, MEET
 import { app, desktopCapturer, systemPreferences } from 'electron'
 import { array, literal, nonEmpty, picklist, pipe, safeParse, strictObject, string, trim } from 'valibot'
 
+import { hasMacOSApplicationAudioCaptureExecutable } from './macos-application-audio'
+
 type NativeComponentKind = 'virtual-camera' | 'meeting-audio'
 
 interface NativeComponentManifest {
@@ -295,14 +297,16 @@ async function detectMacOSCompatibilityComponents() {
     'BlackHole2ch.driver',
   )
 
-  const [obsResults, blackHoleInstalled] = await Promise.all([
+  const [obsResults, blackHoleInstalled, applicationAudioCaptureBundled] = await Promise.all([
     Promise.all(obsPaths.map(pathExists)),
     pathExists(blackHoleDriverPath),
+    hasMacOSApplicationAudioCaptureExecutable(),
   ])
 
   return {
     obsInstalled: obsResults.some(Boolean),
     blackHoleInstalled,
+    applicationAudioCaptureBundled,
   }
 }
 
@@ -324,7 +328,7 @@ async function inspectCompatibilityRoutes(params: {
   const platformSupported = params.platform === 'darwin' && systemMajor >= 13
   const components = params.platform === 'darwin'
     ? await detectMacOSCompatibilityComponents()
-    : { obsInstalled: false, blackHoleInstalled: false }
+    : { obsInstalled: false, blackHoleInstalled: false, applicationAudioCaptureBundled: false }
   const permission = params.platform === 'darwin' ? screenCapturePermission() : 'unavailable'
 
   let captureSources: Awaited<ReturnType<typeof desktopCapturer.getSources>> = []
@@ -390,6 +394,17 @@ async function inspectCompatibilityRoutes(params: {
     }
     else if (route === 'remote-audio-in') {
       routePermission = permission
+      if (!components.applicationAudioCaptureBundled) {
+        component = 'not-bundled'
+        issues.push(createPreflightError({
+          code: 'MEETING_MEDIA_APPLICATION_AUDIO_CAPTURE_NOT_BUNDLED',
+          category: 'INSTALLATION',
+          route,
+          sessionId: params.sessionId,
+          message: 'The application-filtered macOS meeting audio helper is not bundled with this AIRI build.',
+          action: 'install-native-component',
+        }))
+      }
       if (permission !== 'granted') {
         issues.push(createPreflightError({
           code: 'MEETING_MEDIA_SCREEN_AUDIO_PERMISSION_REQUIRED',
@@ -428,7 +443,7 @@ async function inspectCompatibilityRoutes(params: {
             id: source.id,
             name: source.name,
             kind: 'meeting-speaker',
-            backend: 'electron-screencapturekit',
+            backend: 'screencapturekit-application-audio',
           })
         }
       }

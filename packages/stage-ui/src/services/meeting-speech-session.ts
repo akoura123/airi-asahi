@@ -8,13 +8,12 @@ import type { HearingStreamingTranscriptionSession } from '../stores/modules/hea
 
 import { toWav } from '@proj-airi/audio/encoding'
 import { joinTranscriptFragments } from '@proj-airi/pipelines-audio'
-import { storeToRefs } from 'pinia'
 import { shallowRef } from 'vue'
 
 import vadWorkletUrl from '../workers/vad/process.worklet?worker&url'
 
 import { useVAD } from '../stores/ai/models/vad'
-import { resolveActiveTranscriptionModel, useHearingSpeechInputPipeline, useHearingStore } from '../stores/modules/hearing'
+import { useHearingSpeechInputPipeline } from '../stores/modules/hearing'
 import { useProvidersStore } from '../stores/providers'
 import { MeetingTurnAssembler } from './meeting-speech'
 
@@ -55,11 +54,8 @@ function normalizedError(error: unknown): Error {
  * Batch and streaming providers share the same segment correlation and turn-end boundary.
  */
 export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
-  const hearingStore = useHearingStore()
   const hearingPipeline = useHearingSpeechInputPipeline()
   const providersStore = useProvidersStore()
-  const { activeTranscriptionModel, activeTranscriptionProvider } = storeToRefs(hearingStore)
-  const { error: hearingError, supportsStreamInput } = storeToRefs(hearingPipeline)
 
   const vadThreshold = shallowRef(0.52)
   const vadMinSilenceDurationMs = shallowRef(1200)
@@ -69,6 +65,43 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
   let active: ActiveMeetingSpeechSession | null = null
   let generation = 0
   let finalization = Promise.resolve()
+
+  /**
+   * Verifies the exact provider/model frozen into a meeting profile without allocating audio resources.
+   * The same boundary is used by renderer preflight and by `start`, so runtime never depends on a
+   * later mutation of the global Hearing selection.
+   */
+  async function preflight(profile: MeetingMediaSpeechProfile): Promise<void> {
+    const providerId = profile.providerId.trim()
+    const model = profile.model.trim()
+    if (!providerId || !model)
+      throw new Error('The meeting ASR provider and model must be selected explicitly.')
+
+    const metadata = providersStore.findProviderMetadata(providerId)
+    if (!metadata)
+      throw new Error(`The meeting ASR provider "${providerId}" is not registered.`)
+
+    if (metadata.category !== 'transcription')
+      throw new Error(`Provider "${providerId}" is not a transcription provider.`)
+
+    const available = metadata.isAvailableBy ? await metadata.isAvailableBy() : true
+    if (!available)
+      throw new Error(`The meeting ASR provider "${providerId}" is unavailable in this runtime.`)
+
+    const configured = metadata.requiresCredentials === false
+      ? providersStore.configuredProviders[providerId] === true
+      : await providersStore.validateProvider(providerId, { force: true })
+    if (!configured)
+      throw new Error(`The meeting ASR provider "${providerId}" is not configured or authenticated.`)
+
+    const features = providersStore.getTranscriptionFeatures(providerId)
+    if (profile.mode === 'batch' && !features.supportsGenerate)
+      throw new Error(`The meeting ASR provider "${providerId}" does not support batch transcription.`)
+    if (profile.mode === 'streaming' && !features.supportsStreamInput)
+      throw new Error(`The meeting ASR provider "${providerId}" does not support streaming audio input.`)
+
+    await providersStore.getProviderInstance(providerId)
+  }
 
   function reportFailure(error: unknown): void {
     const session = active
@@ -133,18 +166,18 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
 
     if (session.profile.mode !== 'streaming')
       return
-    if (!supportsStreamInput.value) {
-      reportFailure(new Error('The selected transcription provider does not support streaming input.'))
-      return
-    }
 
     segment.streamingSession = hearingPipeline.transcribeForMediaStream(session.stream, {
+      selection: {
+        providerId: session.profile.providerId,
+        model: session.profile.model,
+      },
       idleTimeoutMs: 0,
       providerOptions: { language: session.profile.locale },
       onSentenceEnd: delta => acceptPartial(session, segment, delta),
     }).then((streamingSession) => {
       if (!streamingSession)
-        throw new Error(hearingError.value || 'The streaming transcription provider did not start a session.')
+        throw new Error(hearingPipeline.error || 'The streaming transcription provider did not start a session.')
       return streamingSession
     })
     await segment.streamingSession
@@ -171,7 +204,7 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
       }
       const { text } = result
       if (typeof text !== 'string')
-        throw new Error(hearingError.value || emptyResultMessage)
+        throw new Error(hearingPipeline.error || emptyResultMessage)
 
       const outcome = session.assembler.acceptTranscript({
         type: 'final',
@@ -246,6 +279,10 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
       return hearingPipeline.transcribeForRecording(
         new Blob([wav], { type: 'audio/wav' }),
         {
+          selection: {
+            providerId: session.profile.providerId,
+            model: session.profile.model,
+          },
           providerOptions: {
             abortSignal: abortController.signal,
             language: session.profile.locale,
@@ -278,14 +315,7 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
   }): Promise<void> {
     if (active)
       throw new Error(`Meeting speech input is already owned by session "${active.sessionId}".`)
-    const activeModel = resolveActiveTranscriptionModel(
-      activeTranscriptionModel.value,
-      providersStore.getProviderConfig(activeTranscriptionProvider.value),
-    )
-    if (activeTranscriptionProvider.value !== params.profile.providerId
-      || activeModel !== params.profile.model) {
-      throw new Error('The meeting ASR profile must match the currently active transcription provider and model.')
-    }
+    await preflight(params.profile)
 
     vadThreshold.value = params.profile.vad.threshold
     vadMinSilenceDurationMs.value = params.profile.vad.minSilenceDurationMs
@@ -344,5 +374,5 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
     finalization = Promise.resolve()
   }
 
-  return { start, stop }
+  return { preflight, start, stop }
 }

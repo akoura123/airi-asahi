@@ -442,14 +442,14 @@ export function setupOfficialSpeechAutoPick(ctx: {
   availableVoices: Ref<Record<string, VoiceInfo[]>>
   uiLocale: WatchSource<string> | Ref<string>
 }) {
-  watch([ctx.availableVoices, ctx.activeSpeechProvider], ([voices, provider]) => {
+  watch([ctx.availableVoices, ctx.activeSpeechProvider, ctx.activeSpeechVoiceId], ([voices, provider, voiceId]) => {
     if (!AUTO_PICK_PROVIDER_IDS.has(provider))
       return
 
     const providerVoices = voices[provider]
     if (!providerVoices?.length)
       return
-    if (ctx.activeSpeechVoiceId.value && providerVoices.some(v => v.id === ctx.activeSpeechVoiceId.value))
+    if (voiceId && providerVoices.some(v => v.id === voiceId))
       return
 
     const localeCodes = Array.from(new Set(
@@ -480,6 +480,8 @@ export function setupOfficialSpeechAutoPick(ctx: {
       || providerVoices.find(v => speaksLocale(v, 'en-US'))
       || providerVoices.find(v => (v.languages || []).some(l => l.code.toLowerCase().startsWith('en')))
       || providerVoices[0]
+    // Applying a character card can clear a previously selected voice after the catalog
+    // has stabilized. Tracking the selection itself reruns the same official default policy.
     if (match)
       ctx.activeSpeechVoiceId.value = match.id
   }, { deep: true, immediate: true })

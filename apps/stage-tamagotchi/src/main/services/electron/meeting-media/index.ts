@@ -10,6 +10,7 @@ import type {
 } from '@proj-airi/stage-shared/meeting-media'
 import type { BrowserWindow, Rectangle } from 'electron'
 
+import type { MacOSApplicationAudioCaptureSession } from './macos-application-audio'
 import type { MeetingMediaPlatformProbe } from './platform'
 
 import { randomUUID } from 'node:crypto'
@@ -31,8 +32,10 @@ import { ipcMain } from 'electron'
 
 import {
   electronMeetingMediaGetRuntime,
+  electronMeetingMediaPcmChunk,
   electronMeetingMediaPreflight,
   electronMeetingMediaRendererMetrics,
+  electronMeetingMediaRendererPreflight,
   electronMeetingMediaRendererRouteFailed,
   electronMeetingMediaRendererStart,
   electronMeetingMediaRendererStop,
@@ -41,6 +44,7 @@ import {
   electronMeetingMediaStop,
 } from '../../../../shared/eventa'
 import { onAppBeforeQuit } from '../../../libs/bootkit/lifecycle'
+import { startMacOSApplicationAudioCapture } from './macos-application-audio'
 
 type EventaContext = ReturnType<typeof createContext>['context']
 
@@ -60,7 +64,8 @@ export interface MeetingMediaWindowRegistration {
  * Renderer Eventa invoke
  *   -> {@link MeetingMediaService.start}
  *     -> platform preflight
- *       -> native session allocation (added by the platform implementation stage)
+ *       -> renderer VAD/ASR allocation
+ *         -> application-filtered ScreenCaptureKit audio allocation
  */
 export interface MeetingMediaService {
   registerWindow: (registration: MeetingMediaWindowRegistration) => void
@@ -167,6 +172,7 @@ interface MeetingOutputWindowSnapshot {
   title: string
   alwaysOnTop: boolean
   visible: boolean
+  backgroundThrottling: boolean
 }
 
 function mergeDevices(...groups: MeetingMediaRuntime['devices'][]): MeetingMediaRuntime['devices'] {
@@ -174,6 +180,25 @@ function mergeDevices(...groups: MeetingMediaRuntime['devices'][]): MeetingMedia
   for (const device of groups.flat())
     devices.set(`${device.kind}:${device.id}`, device)
   return Array.from(devices.values())
+}
+
+function addPreflightIssue(preflight: MeetingMediaPreflight, error: MeetingMediaError): MeetingMediaPreflight {
+  if (!error.route)
+    return { ...preflight, ready: false }
+
+  const route = preflight.routes[error.route]
+  return {
+    ...preflight,
+    ready: false,
+    routes: {
+      ...preflight.routes,
+      [error.route]: {
+        ...route,
+        ready: false,
+        issues: [...route.issues, error],
+      },
+    },
+  }
 }
 
 /** Creates and registers the single process-wide meeting-media service. */
@@ -191,7 +216,7 @@ export function setupMeetingMediaService(options: {
   const { context: commandContext, dispose: disposeCommandContext } = createContext(ipcMain)
   const commandCleanups = [
     defineInvokeHandler(commandContext, electronMeetingMediaGetRuntime, () => getRuntime()),
-    defineInvokeHandler(commandContext, electronMeetingMediaPreflight, payload => preflight(parseMeetingMediaProfile(payload.profile))),
+    defineInvokeHandler(commandContext, electronMeetingMediaPreflight, payload => preflight(payload.profile)),
     defineInvokeHandler(commandContext, electronMeetingMediaStart, payload => start(payload.profile)),
     defineInvokeHandler(commandContext, electronMeetingMediaStop, payload => stop(payload.sessionId)),
   ]
@@ -199,6 +224,7 @@ export function setupMeetingMediaService(options: {
   let disposed = false
   let mediaHostRegistration: MeetingMediaWindowRegistration | undefined
   let meetingOutputWindowSnapshot: MeetingOutputWindowSnapshot | undefined
+  let applicationAudioCapture: MacOSApplicationAudioCaptureSession | null = null
 
   function getRuntime(): MeetingMediaRuntime {
     return cloneRuntime(runtime)
@@ -234,11 +260,15 @@ export function setupMeetingMediaService(options: {
         title: window.getTitle(),
         alwaysOnTop: window.isAlwaysOnTop(),
         visible: window.isVisible(),
+        backgroundThrottling: window.webContents.getBackgroundThrottling(),
       }
     }
 
     // OBS captures this exact frameless content surface; window chrome and AIRI controls are
     // hidden by the renderer while the same Stage instance continues rendering underneath.
+    // macOS marks a fully occluded window as backgrounded, so the meeting frame loop must opt out
+    // of Chromium timer/rAF throttling for the duration of this output reservation.
+    window.webContents.setBackgroundThrottling(false)
     window.setAlwaysOnTop(false)
     window.setTitle(MEETING_MEDIA_COMPATIBILITY_NAMES.outputWindow)
     window.setContentSize(profile.video.width, profile.video.height, false)
@@ -256,20 +286,79 @@ export function setupMeetingMediaService(options: {
     window.setTitle(snapshot.title)
     window.setBounds(snapshot.bounds, false)
     window.setAlwaysOnTop(snapshot.alwaysOnTop)
+    window.webContents.setBackgroundThrottling(snapshot.backgroundThrottling)
     if (!snapshot.visible)
       window.hide()
   }
 
-  async function stopRendererSession(sessionId: string): Promise<void> {
+  async function stopCompatibilitySession(sessionId: string): Promise<void> {
+    let cleanupError: unknown
+    const capture = applicationAudioCapture
+    if (capture?.sessionId === sessionId) {
+      applicationAudioCapture = null
+      try {
+        await capture.stop()
+      }
+      catch (error) {
+        cleanupError = error
+      }
+    }
+
     const host = mediaHostRegistration
-    if (!host || host.window.isDestroyed())
-      return
-    await defineInvoke(host.context, electronMeetingMediaRendererStop)({ sessionId })
+    if (host && !host.window.isDestroyed()) {
+      try {
+        await defineInvoke(host.context, electronMeetingMediaRendererStop)({ sessionId })
+      }
+      catch (error) {
+        cleanupError ??= error
+      }
+    }
+
+    if (cleanupError)
+      throw cleanupError
+  }
+
+  async function preflightValidated(profile: MeetingMediaProfile, sessionId?: string): Promise<MeetingMediaPreflight> {
+    let result = await options.platformProbe.preflight(profile, sessionId)
+    if (profile.backend !== 'compatibility' || !profile.receiveAudio.enabled)
+      return result
+
+    const host = mediaHostRegistration
+    if (!host || host.window.isDestroyed()) {
+      return addPreflightIssue(result, createSessionError({
+        code: 'MEETING_MEDIA_RENDERER_HOST_UNAVAILABLE',
+        category: 'PROCESSING',
+        route: 'remote-audio-in',
+        phase: 'preflight',
+        sessionId,
+        message: 'The main Stage renderer is unavailable for meeting ASR preflight.',
+        action: 'retry',
+      }))
+    }
+
+    try {
+      const rendererResult = await defineInvoke(host.context, electronMeetingMediaRendererPreflight)({ profile, sessionId })
+      if (!rendererResult.ready)
+        result = addPreflightIssue(result, rendererResult.error)
+    }
+    catch (error) {
+      result = addPreflightIssue(result, createSessionError({
+        code: 'MEETING_MEDIA_RENDERER_PREFLIGHT_FAILED',
+        category: 'PROCESSING',
+        route: 'remote-audio-in',
+        phase: 'preflight',
+        sessionId,
+        message: 'The renderer could not verify the meeting VAD and ASR pipeline.',
+        action: 'retry',
+        cause: errorMessageFrom(error) ?? 'Unknown renderer preflight failure.',
+      }))
+    }
+
+    return result
   }
 
   async function preflight(profile: MeetingMediaProfile): Promise<MeetingMediaPreflight> {
-    const validatedProfile = parseMeetingMediaProfile(profile)
-    return await options.platformProbe.preflight(validatedProfile)
+    return await preflightValidated(parseMeetingMediaProfile(profile))
   }
 
   async function start(profile: MeetingMediaProfile): Promise<MeetingMediaCommandResult> {
@@ -315,7 +404,7 @@ export function setupMeetingMediaService(options: {
 
       let result: MeetingMediaPreflight
       try {
-        result = await options.platformProbe.preflight(validatedProfile, sessionId)
+        result = await preflightValidated(validatedProfile, sessionId)
       }
       catch (error) {
         const startError = createSessionError({
@@ -375,6 +464,51 @@ export function setupMeetingMediaService(options: {
             return { accepted: true, runtime: getRuntime(), error: rendererResult.error }
           }
 
+          if (validatedProfile.receiveAudio.enabled) {
+            try {
+              if (applicationAudioCapture)
+                throw new Error(`Application audio capture is still owned by session "${applicationAudioCapture.sessionId}".`)
+
+              applicationAudioCapture = await startMacOSApplicationAudioCapture({
+                sessionId,
+                captureSourceId: validatedProfile.receiveAudio.captureSourceId,
+                onChunk(chunk) {
+                  if (runtime.sessionId !== sessionId || host.window.isDestroyed())
+                    return
+                  host.context.emit(electronMeetingMediaPcmChunk, chunk)
+                },
+                onFailure(error) {
+                  handleRouteFailure(createSessionError({
+                    code: 'MEETING_MEDIA_APPLICATION_AUDIO_CAPTURE_FAILED',
+                    category: 'TRANSPORT',
+                    route: 'remote-audio-in',
+                    phase: 'run',
+                    sessionId,
+                    message: 'The selected meeting application audio capture stopped unexpectedly.',
+                    action: 'retry',
+                    cause: errorMessageFrom(error) ?? 'Unknown ScreenCaptureKit failure.',
+                  }))
+                },
+              })
+            }
+            catch (error) {
+              await stopCompatibilitySession(sessionId).catch(() => {})
+              restoreMeetingOutputWindow()
+              const captureError = createSessionError({
+                code: 'MEETING_MEDIA_APPLICATION_AUDIO_CAPTURE_START_FAILED',
+                category: 'TRANSPORT',
+                route: 'remote-audio-in',
+                phase: 'start',
+                sessionId,
+                message: 'The selected meeting application audio capture could not be started.',
+                action: 'retry',
+                cause: errorMessageFrom(error) ?? 'Unknown ScreenCaptureKit startup failure.',
+              })
+              updateRuntime(runtimeWithStartFailure(runtime, result, captureError))
+              return { accepted: true, runtime: getRuntime(), error: captureError }
+            }
+          }
+
           const runningAtMs = Date.now()
           updateRuntime({
             ...runtime,
@@ -405,7 +539,7 @@ export function setupMeetingMediaService(options: {
           return { accepted: true, runtime: getRuntime(), error: null }
         }
         catch (error) {
-          await stopRendererSession(sessionId).catch(() => {})
+          await stopCompatibilitySession(sessionId).catch(() => {})
           restoreMeetingOutputWindow()
           const rendererError = createSessionError({
             code: 'MEETING_MEDIA_RENDERER_HOST_START_FAILED',
@@ -469,7 +603,7 @@ export function setupMeetingMediaService(options: {
       let stopError: MeetingMediaError | null = null
       if (runtime.activeProfile?.backend === 'compatibility') {
         try {
-          await stopRendererSession(sessionId)
+          await stopCompatibilitySession(sessionId)
         }
         catch (error) {
           stopError = createSessionError({
@@ -505,7 +639,7 @@ export function setupMeetingMediaService(options: {
       mediaHostRegistration = undefined
   }
 
-  function handleRendererRouteFailure(error: MeetingMediaError): void {
+  function handleRouteFailure(error: MeetingMediaError): void {
     void transitionMutex.runExclusive(async () => {
       if (runtime.sessionId !== error.sessionId || runtime.state !== 'running')
         return
@@ -527,7 +661,7 @@ export function setupMeetingMediaService(options: {
         })) as Record<MeetingMediaRoute, MeetingMediaRouteRuntime>,
       })
 
-      await stopRendererSession(sessionId).catch(stopError => log.withError(stopError).warn('Failed to clean up renderer after route failure'))
+      await stopCompatibilitySession(sessionId).catch(stopError => log.withError(stopError).warn('Failed to clean up compatibility media after route failure'))
       restoreMeetingOutputWindow()
       const failedAtMs = Date.now()
       updateRuntime({
@@ -575,7 +709,7 @@ export function setupMeetingMediaService(options: {
     const cleanups = [
       context.on(electronMeetingMediaRendererRouteFailed, (event) => {
         if (registration.mediaHost && event.body)
-          handleRendererRouteFailure(event.body)
+          handleRouteFailure(event.body)
       }),
       context.on(electronMeetingMediaRendererMetrics, (event) => {
         if (registration.mediaHost && event.body)

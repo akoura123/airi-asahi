@@ -2,14 +2,17 @@ import type {
   MeetingMediaDevice,
   MeetingMediaError,
   MeetingMediaMetrics,
+  MeetingMediaPcmChunk,
   MeetingMediaProfile,
   MeetingMediaRendererMetricsUpdate,
+  MeetingMediaRendererPreflightResult,
   MeetingMediaRendererStartResult,
   MeetingMediaRoute,
 } from '@proj-airi/stage-shared/meeting-media'
 
+import type { MeetingPcmMediaStream } from './meeting-pcm-media-stream'
+
 import { errorMessageFrom } from '@moeru/std'
-import { setupElectronScreenCapture } from '@proj-airi/electron-screen-capture/renderer'
 import { getElectronEventaContext } from '@proj-airi/electron-vueuse'
 import { createInitialMeetingMediaMetrics, MEETING_MEDIA_COMPATIBILITY_NAMES } from '@proj-airi/stage-shared/meeting-media'
 import { startMeetingAgentAudioOutput, stopMeetingAgentAudioOutput } from '@proj-airi/stage-ui/services/meeting-audio'
@@ -19,14 +22,20 @@ import {
   getMeetingVideoOutputSurface,
   MeetingVideoCompositor,
 } from '@proj-airi/stage-ui/services/meeting-video'
+import { useSpeechStore } from '@proj-airi/stage-ui/stores/modules/speech'
+import { useProvidersStore } from '@proj-airi/stage-ui/stores/providers'
+import { useSpeechOutputControlStore } from '@proj-airi/stage-ui/stores/speech-output-control'
+import { watch } from 'vue'
 
+import { electronMeetingMediaPcmChunk } from '../../shared/eventa'
 import { useChatSyncStore } from '../stores/chat-sync'
+import { createMeetingPcmMediaStream } from './meeting-pcm-media-stream'
 import { releaseMeetingSpeechInput, reserveMeetingSpeechInput } from './meeting-speech-input-controller'
 
 interface ActiveCompatibilitySession {
   sessionId: string
   profile: MeetingMediaProfile
-  remoteAudioStream: MediaStream | null
+  remoteAudioInput: MeetingPcmMediaStream | null
   speechInputReserved: boolean
   metrics: MeetingMediaMetrics
   metricsTimerId: number | null
@@ -50,8 +59,9 @@ function routeError(params: {
   category: MeetingMediaError['category']
   route: MeetingMediaRoute
   phase: MeetingMediaError['phase']
-  sessionId: string
+  sessionId?: string
   message: string
+  action?: MeetingMediaError['action']
   cause?: string
 }): MeetingMediaError {
   return {
@@ -59,10 +69,10 @@ function routeError(params: {
     category: params.category,
     route: params.route,
     phase: params.phase,
-    sessionId: params.sessionId,
+    ...(params.sessionId ? { sessionId: params.sessionId } : {}),
     occurredAtMs: Date.now(),
     message: params.message,
-    action: 'retry',
+    action: params.action ?? 'retry',
     ...(params.cause ? { cause: params.cause } : {}),
   }
 }
@@ -77,8 +87,68 @@ function errorCause(error: unknown): string {
  */
 export function createMeetingMediaRendererHost(options: MeetingMediaRendererHostOptions) {
   const chatSyncStore = useChatSyncStore()
-  const screenCapture = setupElectronScreenCapture(getElectronEventaContext())
+  const providersStore = useProvidersStore()
+  const speechOutputControlStore = useSpeechOutputControlStore()
+  const speechOutputStore = useSpeechStore()
+  const eventaContext = getElectronEventaContext()
   let active: ActiveCompatibilitySession | null = null
+
+  function resolveAgentSpeechOutputError(
+    phase: MeetingMediaError['phase'],
+    sessionId?: string,
+  ): MeetingMediaError | null {
+    if (speechOutputControlStore.speechMuted) {
+      return routeError({
+        code: 'MEETING_MEDIA_AGENT_SPEECH_MUTED',
+        category: 'OUTPUT',
+        route: 'agent-audio-out',
+        phase,
+        sessionId,
+        message: 'AIRI speech output is muted.',
+        cause: 'Unmute AIRI speech output before using the meeting virtual microphone.',
+      })
+    }
+
+    const providerId = speechOutputStore.activeSpeechProvider
+    // OpenAI-compatible speech constructs its voice from provider config inside the TTS pipeline.
+    const providerResolvesVoiceFromConfig = providerId === 'openai-compatible-audio-speech'
+    const selectedVoice = speechOutputStore.activeSpeechVoice
+    const voiceIsResolvedForProvider = providerResolvesVoiceFromConfig
+      || (selectedVoice?.id === speechOutputStore.activeSpeechVoiceId && selectedVoice.provider === providerId)
+    if (!providersStore.configuredProviders[providerId] || !speechOutputStore.configured || !voiceIsResolvedForProvider) {
+      return routeError({
+        code: 'MEETING_MEDIA_TTS_PROVIDER_NOT_READY',
+        category: 'PROVIDER',
+        route: 'agent-audio-out',
+        phase,
+        sessionId,
+        message: 'The selected AIRI speech provider is not ready to synthesize meeting audio.',
+        cause: 'Select a TTS provider, model, and voice before using the meeting virtual microphone.',
+      })
+    }
+
+    return null
+  }
+
+  const stopSpeechOutputReadinessWatch = watch(
+    [
+      () => speechOutputControlStore.speechMuted,
+      () => providersStore.configuredProviders[speechOutputStore.activeSpeechProvider],
+      () => speechOutputStore.configured,
+      () => speechOutputStore.activeSpeechProvider,
+      () => speechOutputStore.activeSpeechVoice?.id,
+      () => speechOutputStore.activeSpeechVoice?.provider,
+    ],
+    () => {
+      const session = active
+      if (!session?.profile.agentAudio.enabled)
+        return
+
+      const error = resolveAgentSpeechOutputError('run', session.sessionId)
+      if (error)
+        options.reportRouteFailure(error)
+    },
+  )
 
   function reportRuntimeFailure(
     sessionId: string,
@@ -100,6 +170,35 @@ export function createMeetingMediaRendererHost(options: MeetingMediaRendererHost
       cause: errorCause(error),
     }))
   }
+
+  const stopPcmSubscription = eventaContext.on(electronMeetingMediaPcmChunk, (event) => {
+    const chunk: MeetingMediaPcmChunk | undefined = event.body
+    const session = active
+    // Session ID is the ownership boundary. Late native callbacks from an older helper are ignored
+    // and can never enter a newly started VAD/ASR pipeline.
+    if (!chunk
+      || !session
+      || chunk.sessionId !== session.sessionId
+      || !session.remoteAudioInput) {
+      return
+    }
+
+    session.metrics.remoteAudio.sampleRate = chunk.sampleRate
+    session.metrics.remoteAudio.channels = chunk.channelCount
+    try {
+      session.remoteAudioInput.push(chunk)
+    }
+    catch (error) {
+      reportRuntimeFailure(
+        session.sessionId,
+        'remote-audio-in',
+        'PROCESSING',
+        'MEETING_MEDIA_PCM_PIPELINE_FAILED',
+        'The application-filtered meeting PCM stream could not be normalized or rendered.',
+        error,
+      )
+    }
+  })
 
   const speech = useMeetingSpeechSession({
     onPartial(event) {
@@ -236,55 +335,22 @@ export function createMeetingMediaRendererHost(options: MeetingMediaRendererHost
   async function startRemoteAudio(session: ActiveCompatibilitySession): Promise<MeetingMediaDevice> {
     const sourceId = session.profile.receiveAudio.captureSourceId
     const sourceName = session.profile.receiveAudio.captureSourceName
-    const stream = await screenCapture.selectWithSource(
-      (sources) => {
-        const source = sources.find(item => item.id === sourceId && (!sourceName || item.name === sourceName))
-        if (!source)
-          throw new Error('The exact meeting capture source is no longer available.')
-        return source.id
-      },
-      () => navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: {
-          autoGainControl: false,
-          echoCancellation: false,
-          noiseSuppression: false,
-        },
-      }),
-      {
-        sourcesOptions: { types: ['window'] },
-        request: { timeout: 15000 },
-      },
-    )
-
-    for (const videoTrack of stream.getVideoTracks()) {
-      videoTrack.stop()
-      stream.removeTrack(videoTrack)
-    }
-    if (stream.getAudioTracks().length === 0) {
-      stream.getTracks().forEach(track => track.stop())
-      throw new Error('The selected meeting source returned no audio track.')
-    }
-
-    session.remoteAudioStream = stream
-    const audioTrack = stream.getAudioTracks()[0]
-    const audioSettings = audioTrack?.getSettings()
-    session.metrics.remoteAudio.sampleRate = audioSettings?.sampleRate ?? 0
-    session.metrics.remoteAudio.channels = audioSettings?.channelCount ?? 0
-    for (const track of stream.getAudioTracks()) {
-      track.addEventListener('ended', () => reportRuntimeFailure(
+    const input = await createMeetingPcmMediaStream({
+      sessionId: session.sessionId,
+      onFailure: error => reportRuntimeFailure(
         session.sessionId,
         'remote-audio-in',
-        'DEVICE',
-        'MEETING_MEDIA_CAPTURE_STREAM_ENDED',
-        'The selected meeting audio capture stream ended.',
-        new Error(`Audio track "${track.label}" ended.`),
-      ), { once: true })
-    }
+        'PROCESSING',
+        'MEETING_MEDIA_PCM_RENDERER_FAILED',
+        'The application-filtered meeting PCM renderer stopped unexpectedly.',
+        error,
+      ),
+    })
+    session.remoteAudioInput = input
 
     await speech.start({
       sessionId: session.sessionId,
-      stream,
+      stream: input.stream,
       profile: session.profile.speech,
     })
 
@@ -292,7 +358,7 @@ export function createMeetingMediaRendererHost(options: MeetingMediaRendererHost
       id: sourceId,
       name: sourceName,
       kind: 'meeting-speaker',
-      backend: 'electron-screencapturekit',
+      backend: 'screencapturekit-application-audio',
     }
   }
 
@@ -307,7 +373,7 @@ export function createMeetingMediaRendererHost(options: MeetingMediaRendererHost
         'agent-audio-out',
         'OUTPUT',
         'MEETING_MEDIA_AGENT_OUTPUT_FAILED',
-        'AIRI speech could not be written to the selected virtual audio output.',
+        'AIRI speech could not be synthesized or written to the selected virtual audio output.',
         error,
       ),
     })
@@ -318,6 +384,37 @@ export function createMeetingMediaRendererHost(options: MeetingMediaRendererHost
       kind: 'virtual-microphone',
       backend: 'html-media-sink',
     }
+  }
+
+  async function preflight(profile: MeetingMediaProfile, sessionId?: string): Promise<MeetingMediaRendererPreflightResult> {
+    if (profile.receiveAudio.enabled) {
+      try {
+        await speech.preflight(profile.speech)
+      }
+      catch (error) {
+        return {
+          ready: false,
+          error: routeError({
+            code: 'MEETING_MEDIA_SPEECH_PROVIDER_NOT_READY',
+            category: 'PROVIDER',
+            route: 'remote-audio-in',
+            phase: 'preflight',
+            sessionId,
+            message: 'The selected meeting ASR provider is not ready for this recognition mode.',
+            action: 'configure-speech-recognition',
+            cause: errorCause(error),
+          }),
+        }
+      }
+    }
+
+    if (profile.agentAudio.enabled) {
+      const error = resolveAgentSpeechOutputError('preflight', sessionId)
+      if (error)
+        return { ready: false, error }
+    }
+
+    return { ready: true }
   }
 
   async function stop(sessionId: string): Promise<void> {
@@ -338,16 +435,22 @@ export function createMeetingMediaRendererHost(options: MeetingMediaRendererHost
     catch (error) {
       cleanupError = error
     }
-    finally {
-      session.remoteAudioStream?.getTracks().forEach(track => track.stop())
-      session.remoteAudioStream = null
-      stopMeetingAgentAudioOutput(sessionId)
-      if (session.video) {
-        session.video.stopped = true
-        cancelAnimationFrame(session.video.animationFrameId)
-        session.video.compositor.dispose()
-        session.video = null
+
+    if (session.remoteAudioInput) {
+      try {
+        await session.remoteAudioInput.dispose()
       }
+      catch (error) {
+        cleanupError ??= error
+      }
+      session.remoteAudioInput = null
+    }
+    stopMeetingAgentAudioOutput(sessionId)
+    if (session.video) {
+      session.video.stopped = true
+      cancelAnimationFrame(session.video.animationFrameId)
+      session.video.compositor.dispose()
+      session.video = null
     }
 
     if (session.speechInputReserved) {
@@ -373,7 +476,7 @@ export function createMeetingMediaRendererHost(options: MeetingMediaRendererHost
     const session: ActiveCompatibilitySession = {
       sessionId,
       profile: structuredClone(profile),
-      remoteAudioStream: null,
+      remoteAudioInput: null,
       speechInputReserved: false,
       metrics: createInitialMeetingMediaMetrics(),
       metricsTimerId: null,
@@ -438,5 +541,12 @@ export function createMeetingMediaRendererHost(options: MeetingMediaRendererHost
     }
   }
 
-  return { start, stop }
+  async function dispose(): Promise<void> {
+    stopPcmSubscription()
+    stopSpeechOutputReadinessWatch()
+    if (active)
+      await stop(active.sessionId)
+  }
+
+  return { preflight, start, stop, dispose }
 }

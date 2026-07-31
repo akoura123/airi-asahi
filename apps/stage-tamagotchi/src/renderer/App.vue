@@ -32,6 +32,7 @@ import {
   electronGodotStageGetStatus,
   electronGodotStageStatusChanged,
   electronMeetingMediaRendererMetrics,
+  electronMeetingMediaRendererPreflight,
   electronMeetingMediaRendererRouteFailed,
   electronMeetingMediaRendererStart,
   electronMeetingMediaRendererStop,
@@ -125,6 +126,7 @@ function createFullStageRuntime() {
     : null
   const meetingMediaRendererHostCleanups = meetingMediaRendererHost
     ? [
+        defineInvokeHandler(context.value, electronMeetingMediaRendererPreflight, payload => meetingMediaRendererHost.preflight(payload.profile, payload.sessionId)),
         defineInvokeHandler(context.value, electronMeetingMediaRendererStart, payload => meetingMediaRendererHost.start(payload.sessionId, payload.profile)),
         defineInvokeHandler(context.value, electronMeetingMediaRendererStop, payload => meetingMediaRendererHost.stop(payload.sessionId)),
       ]
@@ -272,8 +274,8 @@ function createFullStageRuntime() {
     dispose() {
       for (const cleanup of meetingMediaRendererHostCleanups)
         cleanup()
-      if (meetingMediaRendererHost && meetingMediaStore.runtime.sessionId)
-        void meetingMediaRendererHost.stop(meetingMediaStore.runtime.sessionId)
+      if (meetingMediaRendererHost)
+        void meetingMediaRendererHost.dispose()
       if (!isAuxiliaryChatRoute)
         contextBridgeStore.dispose()
       mcpToolsStore.dispose()
