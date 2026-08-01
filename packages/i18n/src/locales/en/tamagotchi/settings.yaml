@@ -119,6 +119,18 @@ pages:
         mode-options:
           streaming: Streaming recognition
           batch: Segmented batch recognition
+      tts:
+        title: Meeting TTS
+        description: The meeting session freezes this TTS configuration and does not read the global speech page selection.
+        use-current: Use current speech configuration
+        provider: TTS provider ID
+        provider-placeholder: For example, volcengine
+        model: TTS model
+        model-placeholder: For example, seed-tts-2.0
+        voice: TTS voice ID
+        voice-placeholder: Select or enter a Volcengine voice ID
+        voice-name: Voice name
+        voice-name-placeholder: Optional display name
       vad:
         title: VAD segmentation
         threshold: Speech threshold
@@ -161,6 +173,7 @@ pages:
       MEETING_MEDIA_SESSION_STALE: This operation belongs to an expired meeting-media session.
       MEETING_MEDIA_MONITOR_DEVICE_REQUIRED: Select a physical monitor device for meeting audio.
       MEETING_MEDIA_SPEECH_CONFIG_REQUIRED: Configure the ASR provider, model, and recognition locale.
+      MEETING_MEDIA_TTS_PROVIDER_NOT_READY: Select a configured meeting TTS provider, model, and voice.
       MEETING_MEDIA_COMPATIBILITY_PLATFORM_UNSUPPORTED: The compatibility backend currently requires macOS 13 or later.
       MEETING_MEDIA_OBS_NOT_INSTALLED: OBS Studio was not found in the system or user Applications folder.
       MEETING_MEDIA_SCREEN_AUDIO_PERMISSION_REQUIRED: Grant AIRI Screen and System Audio Recording permission in macOS Settings.

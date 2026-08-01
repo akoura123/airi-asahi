@@ -5,9 +5,11 @@ import type {
   MeetingMediaProfile,
   MeetingMediaReceiveAudioProfile,
   MeetingMediaSpeechProfile,
+  MeetingMediaTtsProfile,
   MeetingMediaVadProfile,
   MeetingMediaVideoProfile,
 } from '@proj-airi/stage-shared/meeting-media'
+import type { VoiceInfo } from '@proj-airi/stage-ui/stores/providers'
 
 import { matchesMeetingMediaDeviceName, MEETING_MEDIA_COMPATIBILITY_NAMES } from '@proj-airi/stage-shared/meeting-media'
 import { Button, FieldCheckbox, FieldInput, FieldRange, FieldSelect } from '@proj-airi/ui'
@@ -21,6 +23,8 @@ const props = defineProps<{
   captureSources: readonly SerializableDesktopCapturerSource[]
   deviceLabelsAvailable: boolean
   activeSpeechProfile: Pick<MeetingMediaSpeechProfile, 'providerId' | 'model' | 'locale'>
+  activeTtsProfile: MeetingMediaTtsProfile
+  ttsVoices: readonly VoiceInfo[]
   authorizingVideoInput: boolean
   authorizingAgentOutput: boolean
 }>()
@@ -75,6 +79,11 @@ const monitorOutputOptions = computed(() => props.monitorOutputs.map((device, in
 const captureSourceOptions = computed(() => props.captureSources.map(source => ({
   label: source.name,
   value: source.id,
+})))
+
+const ttsVoiceOptions = computed(() => props.ttsVoices.map(voice => ({
+  label: voice.name === voice.id ? voice.name : `${voice.name} (${voice.id})`,
+  value: voice.id,
 })))
 
 const agentOutputOptions = computed(() => props.audioOutputs
@@ -158,6 +167,18 @@ function updateReceiveAudio(patch: Partial<MeetingMediaReceiveAudioProfile>): vo
 
 function updateSpeech(patch: Partial<MeetingMediaSpeechProfile>): void {
   updateProfile({ speech: { ...props.profile.speech, ...patch } })
+}
+
+function updateTts(patch: Partial<MeetingMediaTtsProfile>): void {
+  updateProfile({ tts: { ...props.profile.tts, ...patch } })
+}
+
+function updateTtsVoice(voiceId: string | undefined): void {
+  const voice = props.ttsVoices.find(item => item.id === voiceId)
+  updateTts({
+    voiceId: voiceId ?? '',
+    voiceName: voice?.name ?? '',
+  })
 }
 
 function updateVad(patch: Partial<MeetingMediaVadProfile>): void {
@@ -365,6 +386,56 @@ function updateAgentAudio(patch: Partial<MeetingMediaAgentAudioProfile>): void {
           type="number"
           :label="t('tamagotchi.settings.pages.meeting-media.profile.vad.minimum-speech')"
           @update:model-value="updateVad({ minSpeechDurationMs: $event ?? 1 })"
+        />
+      </div>
+
+      <div :class="['flex flex-col gap-4 rounded-xl bg-white/55 p-4 dark:bg-neutral-950/45']">
+        <h3 :class="['text-sm font-semibold']">
+          {{ t('tamagotchi.settings.pages.meeting-media.profile.tts.title') }}
+        </h3>
+        <p :class="['text-xs text-neutral-500 dark:text-neutral-400']">
+          {{ t('tamagotchi.settings.pages.meeting-media.profile.tts.description') }}
+        </p>
+        <Button
+          variant="secondary"
+          size="sm"
+          icon="i-solar:refresh-circle-bold-duotone"
+          :label="t('tamagotchi.settings.pages.meeting-media.profile.tts.use-current')"
+          :disabled="!activeTtsProfile.providerId || !activeTtsProfile.model || !activeTtsProfile.voiceId"
+          @click="updateTts(activeTtsProfile)"
+        />
+        <FieldInput
+          :model-value="profile.tts.providerId"
+          :label="t('tamagotchi.settings.pages.meeting-media.profile.tts.provider')"
+          :placeholder="t('tamagotchi.settings.pages.meeting-media.profile.tts.provider-placeholder')"
+          @update:model-value="updateTts({ providerId: $event ?? '' })"
+        />
+        <FieldInput
+          :model-value="profile.tts.model"
+          :label="t('tamagotchi.settings.pages.meeting-media.profile.tts.model')"
+          :placeholder="t('tamagotchi.settings.pages.meeting-media.profile.tts.model-placeholder')"
+          @update:model-value="updateTts({ model: $event ?? '' })"
+        />
+        <FieldSelect
+          v-if="ttsVoiceOptions.length"
+          :model-value="profile.tts.voiceId"
+          :options="ttsVoiceOptions"
+          :label="t('tamagotchi.settings.pages.meeting-media.profile.tts.voice')"
+          :placeholder="t('tamagotchi.settings.pages.meeting-media.profile.tts.voice-placeholder')"
+          @update:model-value="updateTtsVoice($event)"
+        />
+        <FieldInput
+          v-else
+          :model-value="profile.tts.voiceId"
+          :label="t('tamagotchi.settings.pages.meeting-media.profile.tts.voice')"
+          :placeholder="t('tamagotchi.settings.pages.meeting-media.profile.tts.voice-placeholder')"
+          @update:model-value="updateTts({ voiceId: $event ?? '' })"
+        />
+        <FieldInput
+          :model-value="profile.tts.voiceName"
+          :label="t('tamagotchi.settings.pages.meeting-media.profile.tts.voice-name')"
+          :placeholder="t('tamagotchi.settings.pages.meeting-media.profile.tts.voice-name-placeholder')"
+          @update:model-value="updateTts({ voiceName: $event ?? '' })"
         />
       </div>
 

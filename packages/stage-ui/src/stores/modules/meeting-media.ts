@@ -10,6 +10,7 @@ import { useLocalStorageManualReset } from '@proj-airi/stage-shared/composables'
 import {
   createDefaultMeetingMediaProfile,
   createInitialMeetingMediaRuntime,
+  migrateMeetingMediaProfile,
   parseMeetingMediaProfile,
 } from '@proj-airi/stage-shared/meeting-media'
 import { defineStore } from 'pinia'
@@ -24,13 +25,40 @@ export interface MeetingMediaControl {
   subscribeRuntime: (listener: (runtime: MeetingMediaRuntime) => void) => () => void
 }
 
+const MEETING_MEDIA_PROFILE_KEY = 'settings/meeting-media/profile/v3'
+const LEGACY_MEETING_MEDIA_PROFILE_KEY = 'settings/meeting-media/profile/v2'
+
+/** Moves the raw v2 profile into the v3 storage key before VueUse reads it. */
+function migrateStoredMeetingMediaProfile(): void {
+  if (typeof globalThis.localStorage === 'undefined')
+    return
+
+  if (globalThis.localStorage.getItem(MEETING_MEDIA_PROFILE_KEY) !== null)
+    return
+
+  const rawProfile = globalThis.localStorage.getItem(LEGACY_MEETING_MEDIA_PROFILE_KEY)
+  if (!rawProfile)
+    return
+
+  try {
+    const migrated = migrateMeetingMediaProfile(JSON.parse(rawProfile))
+    if (migrated)
+      globalThis.localStorage.setItem(MEETING_MEDIA_PROFILE_KEY, JSON.stringify(migrated))
+  }
+  catch (error) {
+    console.warn('[Meeting Media] Failed to migrate the persisted v2 profile.', error)
+  }
+}
+
 /**
  * Owns the persisted profile and renderer-side view of the process-wide meeting session.
  * Runtime changes are accepted only through the bound control or explicit store actions.
  */
 export const useMeetingMediaStore = defineStore('modules:meeting-media', () => {
+  migrateStoredMeetingMediaProfile()
+
   const profile = useLocalStorageManualReset<MeetingMediaProfile>(
-    'settings/meeting-media/profile/v2',
+    MEETING_MEDIA_PROFILE_KEY,
     createDefaultMeetingMediaProfile(),
   )
   const runtime = shallowRef<MeetingMediaRuntime>(createInitialMeetingMediaRuntime())

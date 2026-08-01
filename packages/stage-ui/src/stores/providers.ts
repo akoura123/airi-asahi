@@ -21,6 +21,7 @@ import type {
 import type { ProviderSourceDeployment, ProviderSourcePricing } from '../libs/providers/source-metadata'
 import type { ProviderOnboardingField } from '../libs/providers/types'
 import type { AliyunRealtimeSpeechExtraOptions } from './providers/aliyun/stream-transcription'
+import type { VolcengineRealtimeSpeechExtraOptions } from './providers/volcengine/stream-transcription'
 
 import { errorMessageFrom } from '@moeru/std'
 import { isCustomProvidersDisabled, isStageCapacitor, isStageTamagotchi, isUrl } from '@proj-airi/stage-shared'
@@ -62,6 +63,7 @@ import { models as elevenLabsModels } from './providers/elevenlabs/list-models'
 import { buildGoogleGeminiSpeechProvider } from './providers/google-gemini-speech'
 import { buildOpenAICompatibleProvider } from './providers/openai-compatible-builder'
 import { buildOpenRouterAudioSpeechProvider } from './providers/openrouter/audio-speech'
+import { createVolcengineRealtimeTranscriptionProvider } from './providers/volcengine/stream-transcription'
 import { createWebSpeechAPIProvider } from './providers/web-speech-api'
 import { useSettingsAnalytics } from './settings/analytics'
 
@@ -76,6 +78,8 @@ const ALIYUN_NLS_REGIONS = [
 
 const VOLCENGINE_V3_MODEL = 'seed-tts-2.0'
 const VOLCENGINE_V3_RELAY_BASE_URL = new URL('/api/v1/byok/volcengine/', SERVER_URL).toString()
+const VOLCENGINE_ASR_PROVIDER_ID = 'volcengine-transcription'
+const VOLCENGINE_ASR_MODEL = 'volc.seedasr.sauc.duration'
 const VOLCENGINE_VOICE_CATALOG_BASE_URL = 'https://unspeech.hyp3r.link/'
 
 interface VolcengineV3SpeechOptions {
@@ -993,6 +997,62 @@ export const useProvidersStore = defineStore('providers', () => {
         },
       },
     },
+    [VOLCENGINE_ASR_PROVIDER_ID]: {
+      id: VOLCENGINE_ASR_PROVIDER_ID,
+      category: 'transcription',
+      tasks: ['speech-to-text', 'automatic-speech-recognition', 'asr', 'stt', 'streaming-transcription'],
+      nameKey: 'settings.pages.providers.provider.volcengine-transcription.title',
+      name: 'Volcengine Realtime ASR',
+      descriptionKey: 'settings.pages.providers.provider.volcengine-transcription.description',
+      description: 'Volcengine BigModel realtime transcription.',
+      iconColor: 'i-lobe-icons:volcengine',
+      baseUrlConfigurable: false,
+      defaultOptions: () => ({
+        model: VOLCENGINE_ASR_MODEL,
+      }),
+      transcriptionFeatures: {
+        supportsGenerate: false,
+        supportsStreamOutput: true,
+        supportsStreamInput: true,
+      },
+      createProvider: async (config) => {
+        const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : ''
+        if (!apiKey)
+          throw new Error('Volcengine API key is required.')
+
+        const provider = createVolcengineRealtimeTranscriptionProvider(apiKey, VOLCENGINE_V3_RELAY_BASE_URL)
+        return {
+          transcription: (model: string, extraOptions?: VolcengineRealtimeSpeechExtraOptions) => provider.speech(model, extraOptions),
+        } as TranscriptionProviderWithExtraOptions<string, VolcengineRealtimeSpeechExtraOptions>
+      },
+      capabilities: {
+        listModels: async () => {
+          return [
+            {
+              id: VOLCENGINE_ASR_MODEL,
+              name: 'Volcengine BigModel Realtime ASR',
+              provider: VOLCENGINE_ASR_PROVIDER_ID,
+              description: 'Volcengine bidirectional streaming ASR.',
+              contextLength: 0,
+              deprecated: false,
+            },
+          ]
+        },
+      },
+      validators: {
+        chatPingCheckAvailable: false,
+        validateProviderConfig: (config) => {
+          const hasApiKey = typeof config.apiKey === 'string' && config.apiKey.trim().length > 0
+          const errors = hasApiKey ? [] : [new Error('API key is required.')]
+
+          return {
+            errors,
+            reason: errors.map(error => error.message).join(', '),
+            valid: hasApiKey,
+          }
+        },
+      },
+    },
     'browser-web-speech-api': {
       id: 'browser-web-speech-api',
       category: 'transcription',
@@ -1515,7 +1575,7 @@ export const useProvidersStore = defineStore('providers', () => {
             query: query.toString(),
           })
 
-          return voices.map((voice) => {
+          const mappedVoices = voices.map((voice) => {
             return {
               id: voice.id,
               name: voice.name,
@@ -1525,6 +1585,16 @@ export const useProvidersStore = defineStore('providers', () => {
               languages: voice.languages,
               gender: voice.labels?.gender,
             }
+          })
+
+          // The playground's default input is Chinese and selects the first
+          // catalog entry. Keep a Chinese-compatible voice first so the
+          // default test request does not pair Chinese text with an English-
+          // only voice.
+          return mappedVoices.sort((left, right) => {
+            const leftIsChinese = left.languages.some(language => language.code.toLowerCase().startsWith('zh') || language.title.includes('中文'))
+            const rightIsChinese = right.languages.some(language => language.code.toLowerCase().startsWith('zh') || language.title.includes('中文'))
+            return Number(rightIsChinese) - Number(leftIsChinese)
           })
         },
         listModels: async () => {

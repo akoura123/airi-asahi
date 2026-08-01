@@ -1400,6 +1400,9 @@ pages:
       volcengine:
         description: Volcengine Seed-TTS 2.0 (V3)
         title: Volcano Engine
+      volcengine-transcription:
+        description: Volcengine BigModel realtime speech recognition
+        title: Volcengine Realtime ASR
       volcengine-coding-plan:
         description: Volcengine Coding Plan
         title: Volcengine Coding Plan

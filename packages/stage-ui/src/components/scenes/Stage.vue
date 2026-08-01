@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import type { Live2DLipSync, Live2DLipSyncOptions } from '@proj-airi/model-driver-lipsync'
 import type { Profile } from '@proj-airi/model-driver-lipsync/shared/wlipsync'
+import type { MeetingMediaTtsProfile } from '@proj-airi/stage-shared/meeting-media'
 import type { VrmInteractionTarget } from '@proj-airi/stage-ui-three'
 import type { SpeechProviderWithExtraOptions } from '@xsai-ext/providers/utils'
 import type { UnElevenLabsOptions } from 'unspeech'
 
 import type { EmotionPayload } from '../../constants/emotions'
 import type { SpeechTransport, StageTtsSession, StreamingSessionSnapshot } from '../../libs/speech/tts-session'
+import type { VoiceInfo } from '../../stores/providers'
 
 import { defineInvokeHandler } from '@moeru/eventa'
 import { sleep } from '@moeru/std'
@@ -48,6 +50,7 @@ import { useBackgroundStore } from '../../stores/background'
 import { useChatOrchestratorStore } from '../../stores/chat'
 import { useLlmStreamingControlStore } from '../../stores/llm-streaming-control'
 import { useAiriCardStore } from '../../stores/modules'
+import { useMeetingMediaStore } from '../../stores/modules/meeting-media'
 import { useSpeechStore } from '../../stores/modules/speech'
 import { useProvidersStore } from '../../stores/providers'
 import { useSettings } from '../../stores/settings'
@@ -189,10 +192,21 @@ function resetAssistantSpeechSurface(source: string) {
 const { activeCard } = storeToRefs(useAiriCardStore())
 const speechStore = useSpeechStore()
 const { ssmlEnabled, activeSpeechProvider, activeSpeechModel, activeSpeechVoice, pitch } = storeToRefs(speechStore)
+const meetingMediaStore = useMeetingMediaStore()
+const { runtime: meetingMediaRuntime } = storeToRefs(meetingMediaStore)
 const activeCardId = computed(() => activeCard.value?.name ?? 'default')
 const speechRuntimeStore = useSpeechRuntimeStore()
 const { trackOfficialTtsAutoEnabled } = useAnalytics()
 let officialAutoTtsTrackedForTurn = false
+
+interface StageSpeechSelection {
+  providerId: string
+  model: string
+  voice: VoiceInfo
+  providerConfig: Record<string, unknown> | undefined
+}
+
+let currentSpeechSelection: StageSpeechSelection | null = null
 const backgroundStore = useBackgroundStore()
 const { activeBackgroundUrl } = storeToRefs(backgroundStore)
 
@@ -381,9 +395,9 @@ async function playFunction(item: Parameters<Parameters<typeof createPlaybackMan
     try {
       source.start(0)
       if (item.intentId.startsWith('stream-')) {
-        const model = resolveStreamingSessionModel()
+        const model = resolveStreamingSessionModel(currentSpeechSelection ?? resolveTtsSelection())
         if (model)
-          trackOfficialAutoTtsForTurn(model)
+          trackOfficialAutoTtsForTurn(model, currentSpeechSelection?.providerId)
       }
     }
     catch (error) {
@@ -404,26 +418,106 @@ const playbackManager = createPlaybackManager<AudioBuffer>({
 /**
  * Classifies chat auto-TTS voice usage before forwarding analytics to the server.
  */
-function resolveStageVoiceType(): 'official_selected' | 'custom_configured' {
-  return activeSpeechProvider.value === OFFICIAL_SPEECH_PROVIDER_ID || activeSpeechProvider.value === OFFICIAL_SPEECH_STREAMING_PROVIDER_ID ? 'official_selected' : 'custom_configured'
+function resolveStageVoiceType(providerId = currentSpeechSelection?.providerId ?? activeSpeechProvider.value): 'official_selected' | 'custom_configured' {
+  return providerId === OFFICIAL_SPEECH_PROVIDER_ID || providerId === OFFICIAL_SPEECH_STREAMING_PROVIDER_ID ? 'official_selected' : 'custom_configured'
 }
 
 /**
  * Tracks official auto-TTS once per assistant turn when chat audio is actually used.
  */
-function trackOfficialAutoTtsForTurn(modelId: string) {
+function trackOfficialAutoTtsForTurn(modelId: string, providerId = currentSpeechSelection?.providerId ?? activeSpeechProvider.value) {
   if (officialAutoTtsTrackedForTurn)
     return
-  if (activeSpeechProvider.value !== OFFICIAL_SPEECH_PROVIDER_ID && activeSpeechProvider.value !== OFFICIAL_SPEECH_STREAMING_PROVIDER_ID)
+  if (providerId !== OFFICIAL_SPEECH_PROVIDER_ID && providerId !== OFFICIAL_SPEECH_STREAMING_PROVIDER_ID)
     return
 
   officialAutoTtsTrackedForTurn = true
   trackOfficialTtsAutoEnabled({
-    tts_provider_id: activeSpeechProvider.value,
+    tts_provider_id: providerId,
     tts_model_id: modelId,
     source: 'chat_auto_tts',
     enabled: true,
   })
+}
+
+function resolveMeetingProfileVoice(profile: MeetingMediaTtsProfile, locale: string): VoiceInfo | undefined {
+  const voiceId = profile.voiceId.trim()
+  if (!voiceId)
+    return undefined
+
+  const catalogVoice = speechStore.getVoicesForProvider(profile.providerId).find(voice => voice.id === voiceId)
+  if (catalogVoice)
+    return catalogVoice
+
+  const resolvedLocale = locale.trim() || 'zh-CN'
+  return {
+    id: voiceId,
+    name: profile.voiceName.trim() || voiceId,
+    provider: profile.providerId,
+    languages: [{ code: resolvedLocale, title: resolvedLocale }],
+    gender: 'neutral',
+  }
+}
+
+function resolveTtsSelection(): StageSpeechSelection | null {
+  const meetingProfile = meetingMediaRuntime.value.activeProfile
+  if (meetingProfile?.agentAudio.enabled) {
+    const ttsProfile = meetingProfile.tts
+    const providerId = ttsProfile.providerId.trim()
+    const model = ttsProfile.model.trim()
+    const voice = resolveMeetingProfileVoice(ttsProfile, meetingProfile.speech.locale)
+    if (!providerId || !model || !voice)
+      return null
+
+    return {
+      providerId,
+      model,
+      voice,
+      providerConfig: providersStore.getProviderConfig(providerId),
+    }
+  }
+
+  const providerId = activeSpeechProvider.value.trim()
+  if (!providerId || providerId === 'speech-noop')
+    return null
+
+  const providerConfig = providersStore.getProviderConfig(providerId)
+  let model = activeSpeechModel.value
+  let voice = activeSpeechVoice.value
+
+  if (providerId === 'openai-compatible-audio-speech') {
+    model = typeof providerConfig?.model === 'string' && providerConfig.model
+      ? providerConfig.model
+      : 'tts-1'
+    const configuredVoice = typeof providerConfig?.voice === 'string' && providerConfig.voice
+      ? providerConfig.voice
+      : 'alloy'
+    voice = {
+      id: configuredVoice,
+      name: configuredVoice,
+      description: configuredVoice,
+      previewURL: '',
+      languages: [{ code: 'en', title: 'English' }],
+      provider: providerId,
+      gender: 'neutral',
+    }
+  }
+
+  if (!model || !voice)
+    return null
+
+  return {
+    providerId,
+    model,
+    voice,
+    providerConfig,
+  }
+}
+
+function supportsSpeechMarkup(providerId: string, model: string): boolean {
+  if (providerId === 'alibaba-cloud-model-studio' && model === 'cosyvoice-v2')
+    return true
+  return ['elevenlabs', 'microsoft-speech', 'azure-speech'].includes(providerId)
 }
 
 const speechPipeline = createSpeechPipeline<AudioBuffer>({
@@ -436,15 +530,12 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
       return null
     }
 
-    if (activeSpeechProvider.value === 'speech-noop') {
-      reportMeetingAgentAudioFailure(new Error('No active TTS provider is configured.'))
+    const selection = currentSpeechSelection ?? resolveTtsSelection()
+    if (!selection) {
+      reportMeetingAgentAudioFailure(new Error('The current TTS provider, model, or voice is not configured.'))
       return null
     }
-
-    if (!activeSpeechProvider.value) {
-      reportMeetingAgentAudioFailure(new Error('No active TTS provider is selected.'))
-      return null
-    }
+    const { providerId, model, voice, providerConfig } = selection
 
     // Streaming provider must NEVER reach this per-segment callback. The
     // streaming code path opens its own ws at `onBeforeMessageComposed`
@@ -454,11 +545,11 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
     // message). The old fallback would silently re-open a fresh ws per
     // segment — exactly the behavior the refactor is meant to delete.
     // Codex review MEDIUM #3: refuse loudly instead.
-    if (resolveSpeechTransport(activeSpeechProvider.value) === 'bidirectional-ws') {
+    if (resolveSpeechTransport(providerId) === 'bidirectional-ws') {
       const error = new Error('The streaming TTS session was not opened before synthesis started.')
       console.warn('[Speech Pipeline] bidirectional-ws provider reached per-segment fallback', {
         reason: 'streaming session was not opened at intent start (voice unset?)',
-        provider: activeSpeechProvider.value,
+        provider: providerId,
         segment: request.text?.slice(0, 40),
       })
       reportMeetingAgentAudioFailure(error)
@@ -467,7 +558,7 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
 
     let provider: SpeechProviderWithExtraOptions<string, UnElevenLabsOptions> | undefined
     try {
-      provider = await providersStore.getProviderInstance(activeSpeechProvider.value) as SpeechProviderWithExtraOptions<string, UnElevenLabsOptions> | undefined
+      provider = await providersStore.getProviderInstance(providerId) as SpeechProviderWithExtraOptions<string, UnElevenLabsOptions> | undefined
     }
     catch (error) {
       console.error('Failed to initialize speech provider', error)
@@ -476,61 +567,12 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
     }
     if (!provider) {
       console.error('Failed to initialize speech provider')
-      reportMeetingAgentAudioFailure(new Error(`Failed to initialize TTS provider "${activeSpeechProvider.value}".`))
+      reportMeetingAgentAudioFailure(new Error(`Failed to initialize TTS provider "${providerId}".`))
       return null
     }
 
     if (!request.text && !request.special)
       return null
-
-    const providerConfig = providersStore.getProviderConfig(activeSpeechProvider.value)
-
-    // For OpenAI Compatible providers, always use provider config for model and voice
-    // since these are manually configured in provider settings
-    let model = activeSpeechModel.value
-    let voice = activeSpeechVoice.value
-
-    if (activeSpeechProvider.value === 'openai-compatible-audio-speech') {
-      // Always prefer provider config for OpenAI Compatible (user configured it there)
-      if (providerConfig?.model) {
-        model = providerConfig.model as string
-      }
-      else {
-        // Fallback to default if not in provider config
-        model = 'tts-1'
-        console.warn('[Speech Pipeline] OpenAI Compatible: No model in provider config, using default', { providerConfig })
-      }
-
-      if (providerConfig?.voice) {
-        voice = {
-          id: providerConfig.voice as string,
-          name: providerConfig.voice as string,
-          description: providerConfig.voice as string,
-          previewURL: '',
-          languages: [{ code: 'en', title: 'English' }],
-          provider: activeSpeechProvider.value,
-          gender: 'neutral',
-        }
-      }
-      else {
-        // Fallback to default if not in provider config
-        voice = {
-          id: 'alloy',
-          name: 'alloy',
-          description: 'alloy',
-          previewURL: '',
-          languages: [{ code: 'en', title: 'English' }],
-          provider: activeSpeechProvider.value,
-          gender: 'neutral',
-        }
-        console.warn('[Speech Pipeline] OpenAI Compatible: No voice in provider config, using default', { providerConfig })
-      }
-    }
-
-    if (!model || !voice) {
-      reportMeetingAgentAudioFailure(new Error('The active TTS model or voice is not configured.'))
-      return null
-    }
 
     try {
       const speechRequest = speechStore.resolveSpeechInput({
@@ -541,13 +583,13 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
           pitch: ssmlEnabled.value ? pitch.value : undefined,
         },
         forceSSML: ssmlEnabled.value,
-        supportsSSML: speechStore.supportsSSML,
+        supportsSSML: supportsSpeechMarkup(providerId, model),
       })
 
       // Non-streaming providers only: synth via REST. Streaming provider
       // was already early-returned above; it owns its own ws path opened
       // in `onBeforeMessageComposed`.
-      const providerConfigWithAnalytics = activeSpeechProvider.value === OFFICIAL_SPEECH_PROVIDER_ID
+      const providerConfigWithAnalytics = providerId === OFFICIAL_SPEECH_PROVIDER_ID
         ? {
             ...speechRequest.providerConfig,
             extraBody: {
@@ -555,7 +597,7 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
               airi_analytics: {
                 trigger: 'auto',
                 source: 'chat_auto_tts',
-                voice_type: resolveStageVoiceType(),
+                voice_type: resolveStageVoiceType(providerId),
               },
             },
           }
@@ -574,7 +616,7 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
       }
 
       const audioBuffer = await audioContext.decodeAudioData(res)
-      trackOfficialAutoTtsForTurn(model)
+      trackOfficialAutoTtsForTurn(model, providerId)
       return audioBuffer
     }
     catch (err) {
@@ -585,7 +627,7 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
       // produce visible diagnostic lines — see codex review item #6.
       if (!signal.aborted) {
         console.error('[Speech Pipeline] tts() failed', {
-          provider: activeSpeechProvider.value,
+          provider: providerId,
           model,
           voice: voice?.id,
           error: err,
@@ -743,6 +785,7 @@ let currentSession: StageTtsSession | null = null
 function stopSpeechOutput(reason: string) {
   currentSession?.cancel(reason)
   currentSession = null
+  currentSpeechSelection = null
   speechPipeline.stopAll(reason)
   playbackManager.stopAll(reason)
   resetAssistantSpeechSurface(reason)
@@ -751,16 +794,18 @@ function stopSpeechOutput(reason: string) {
 /**
  * Resolves the official streaming TTS model for the current Stage session.
  */
-function resolveStreamingSessionModel(): string | null {
-  const activeModel = activeSpeechModel.value as string | undefined
+function resolveStreamingSessionModel(selection?: StageSpeechSelection | null): string | null {
+  const activeModel = selection?.model ?? activeSpeechModel.value as string | undefined
   const sessionModel = activeModel?.includes('/') ? activeModel : getDefaultStreamingModel()
   if (!sessionModel?.includes('/'))
     return null
   return sessionModel
 }
 
-function buildStreamingSnapshot(turnId: string): StreamingSessionSnapshot | null {
+function buildStreamingSnapshot(turnId: string, selection = currentSpeechSelection ?? resolveTtsSelection()): StreamingSessionSnapshot | null {
   if (speechMuted.value)
+    return null
+  if (!selection)
     return null
 
   // Snapshotted once per session, so a mid-session provider/voice swap
@@ -769,16 +814,14 @@ function buildStreamingSnapshot(turnId: string): StreamingSessionSnapshot | null
   // can't be opened (no voice picked, no audioContext, no model);
   // `createStageTtsSession` falls back to the segmenter adapter in that
   // case, which is the right behaviour for the rest of the providers too.
-  const voiceId = activeSpeechVoice.value?.id
-  if (!voiceId)
-    return null
+  const voiceId = selection.voice.id
   // Resolve the concrete streaming model id. The active speech model is only
   // valid here when it carries the `<backend>/<api_resource_id>` shape the ws
   // upstream expects — the HTTP TTS `auto` alias (and an empty selection after
   // a provider switch) must NOT reach the bridge, so fall back to the
   // server-curated default instead of a hardcoded id. Returns null (segmenter
   // fallback) when neither resolves, rather than guessing a resource id.
-  const sessionModel = resolveStreamingSessionModel()
+  const sessionModel = resolveStreamingSessionModel(selection)
   if (!sessionModel)
     return null
   const apiResourceId = sessionModel.split('/', 2)[1]
@@ -789,7 +832,7 @@ function buildStreamingSnapshot(turnId: string): StreamingSessionSnapshot | null
   return {
     model: sessionModel,
     voice: voiceId,
-    voiceType: resolveStageVoiceType(),
+    voiceType: resolveStageVoiceType(selection.providerId),
     bufferEntireSession,
     extraBody: {
       api_resource_id: apiResourceId,
@@ -810,7 +853,7 @@ function resolveSpeechTransport(providerId: string | null | undefined): SpeechTr
   return getDefinedProvider(providerId)?.capabilities?.speech?.transport
 }
 
-function openTtsSession(turnId: string): StageTtsSession {
+function openTtsSession(turnId: string, selection: StageSpeechSelection): StageTtsSession {
   // A session must only clear the module-level `currentSession` if it IS that session. The previous
   // code cleared it whenever any `stream-` session completed, which is unsafe once sessions exist that
   // are not assigned to `currentSession` (e.g. one-off read-aloud sessions): one of those finishing
@@ -822,8 +865,8 @@ function openTtsSession(turnId: string): StageTtsSession {
       currentSession = null
   }
   session = createStageTtsSession<AudioBuffer>({
-    transport: resolveSpeechTransport(activeSpeechProvider.value),
-    streaming: () => buildStreamingSnapshot(turnId),
+    transport: resolveSpeechTransport(selection.providerId),
+    streaming: () => buildStreamingSnapshot(turnId, selection),
     audioContext,
     playbackManager,
     openIntent: opts => speechRuntimeStore.openIntent(opts),
@@ -836,8 +879,8 @@ function openTtsSession(turnId: string): StageTtsSession {
     hooks: {
       onError: (err) => {
         console.error('[Speech Pipeline] streaming session error', {
-          provider: activeSpeechProvider.value,
-          model: activeSpeechModel.value,
+          provider: selection.providerId,
+          model: selection.model,
           error: err,
         })
         reportMeetingAgentAudioFailure(err)
@@ -874,13 +917,19 @@ chatHookCleanups.push(onBeforeMessageComposed(async (_message, context) => {
 
   currentSession?.cancel('new-message')
   currentSession = null
+  currentSpeechSelection = resolveTtsSelection()
 
   if (speechMuted.value)
     return
 
+  if (!currentSpeechSelection) {
+    reportMeetingAgentAudioFailure(new Error('The current TTS provider, model, or voice is not configured.'))
+    return
+  }
+
   setupAnalyser()
   await setupLipSync()
-  currentSession = openTtsSession(context.turnId)
+  currentSession = openTtsSession(context.turnId, currentSpeechSelection)
 }))
 
 chatHookCleanups.push(onBeforeSend(async () => {
@@ -930,19 +979,32 @@ chatHookCleanups.push(onAssistantResponseEnd(async (_message) => {
 // drop is acceptable — we don't try to fork-replay text into a new
 // adapter with potentially different voice/model).
 watch(
-  [activeSpeechProvider, () => activeSpeechVoice.value?.id, activeSpeechModel],
-  ([provider, voiceId, model], [prevProvider, prevVoiceId, prevModel]) => {
+  [
+    activeSpeechProvider,
+    () => activeSpeechVoice.value?.id,
+    activeSpeechModel,
+    () => meetingMediaRuntime.value.activeProfile?.tts.providerId,
+    () => meetingMediaRuntime.value.activeProfile?.tts.voiceId,
+    () => meetingMediaRuntime.value.activeProfile?.tts.model,
+  ],
+  ([provider, voiceId, model, meetingProvider, meetingVoiceId, meetingModel], [prevProvider, prevVoiceId, prevModel, prevMeetingProvider, prevMeetingVoiceId, prevMeetingModel]) => {
     if (!currentSession)
       return
-    if (provider === prevProvider && voiceId === prevVoiceId && model === prevModel)
+    const usingMeetingTts = !!meetingProvider
+    const wasUsingMeetingTts = !!prevMeetingProvider
+    const selectionChanged = usingMeetingTts !== wasUsingMeetingTts
+      || (usingMeetingTts
+        ? meetingProvider !== prevMeetingProvider || meetingVoiceId !== prevMeetingVoiceId || meetingModel !== prevMeetingModel
+        : provider !== prevProvider || voiceId !== prevVoiceId || model !== prevModel)
+    if (!selectionChanged)
       return
     console.warn('[Speech Pipeline] provider/voice/model changed mid-session, tearing down', {
-      provider,
-      prevProvider,
-      voiceId,
-      prevVoiceId,
-      model,
-      prevModel,
+      provider: usingMeetingTts ? meetingProvider : provider,
+      prevProvider: wasUsingMeetingTts ? prevMeetingProvider : prevProvider,
+      voiceId: usingMeetingTts ? meetingVoiceId : voiceId,
+      prevVoiceId: wasUsingMeetingTts ? prevMeetingVoiceId : prevVoiceId,
+      model: usingMeetingTts ? meetingModel : model,
+      prevModel: wasUsingMeetingTts ? prevMeetingModel : prevModel,
     })
     currentSession.cancel('provider-or-voice-changed')
     currentSession = null

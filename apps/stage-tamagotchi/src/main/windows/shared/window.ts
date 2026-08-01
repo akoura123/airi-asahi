@@ -13,6 +13,12 @@ import { createServerChannelService } from '../../services/airi/channel-server'
 import { createI18nService } from '../../services/airi/i18n'
 import { createAppService, createPowerMonitorService, createScreenService, createSystemPreferencesService, createWindowService } from '../../services/electron'
 
+/** Minimum usable size of the main character window in logical pixels. */
+export const STAGE_WINDOW_MIN_SIZE = {
+  width: 320,
+  height: 420,
+} as const
+
 export function toggleWindowShow(window?: BrowserWindow | null): void {
   if (!window) {
     return
@@ -101,8 +107,8 @@ export function resizeWindowByDelta(params: {
   minHeight?: number
 }): void {
   const bounds = params.window.getBounds()
-  const minWidth = params.minWidth ?? 100
-  const minHeight = params.minHeight ?? 200
+  const minWidth = params.minWidth ?? STAGE_WINDOW_MIN_SIZE.width
+  const minHeight = params.minHeight ?? STAGE_WINDOW_MIN_SIZE.height
 
   let { x, y, width, height } = bounds
 

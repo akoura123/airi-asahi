@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
 
 import { errorMessageFrom } from '@moeru/std'
-import { number, object, optional, safeParse, string } from 'valibot'
+import { nullable, number, object, optional, safeParse, string } from 'valibot'
 
 import { createBadGatewayError, createBadRequestError } from '../../../utils/error'
 import { audioMimeFromFormat } from './audio-format'
@@ -14,7 +14,7 @@ const VOLCENGINE_FINISHED_CODE = 20000000
 const VolcengineStreamChunkSchema = object({
   code: number(),
   message: optional(string()),
-  data: optional(string()),
+  data: optional(nullable(string())),
 })
 
 export type VolcengineV3ResponseFormat = 'mp3' | 'ogg_opus' | 'pcm' | 'wav'

@@ -43,6 +43,9 @@ const TRUSTED_ORIGIN_PATTERNS = [
   /^https:\/\/.*\.kwaa\.workers\.dev$/,
 ]
 
+const OPAQUE_ORIGIN = 'null'
+const BYOK_API_PREFIX = '/api/v1/byok/'
+
 /**
  * Returns `origin` when it matches built-in trust rules or `additionalTrustedOrigins`.
  *
@@ -65,6 +68,35 @@ export function getTrustedOrigin(origin: string, additionalTrustedOrigins: reado
     return origin
   if (TRUSTED_ORIGIN_PATTERNS.some(pattern => pattern.test(origin)))
     return origin
+  return ''
+}
+
+/**
+ * Resolves the CORS origin for an API request.
+ *
+ * Packaged Electron renderers load from `file://` and send the opaque origin
+ * `null`. That origin is accepted only for the BYOK namespace, whose routes
+ * receive a provider credential explicitly in the request instead of AIRI's
+ * cookie-authenticated session. All other API paths keep the normal strict
+ * allowlist.
+ *
+ * @param origin Raw `Origin` request header.
+ * @param requestPath Hono request pathname used to scope the opaque-origin policy.
+ * @param additionalTrustedOrigins Exact origins configured for the deployment.
+ * @returns The response origin to emit, or an empty string when it is not trusted.
+ */
+export function getTrustedCorsOrigin(
+  origin: string,
+  requestPath: string,
+  additionalTrustedOrigins: readonly string[] = [],
+): string {
+  const trustedOrigin = getTrustedOrigin(origin, additionalTrustedOrigins)
+  if (trustedOrigin)
+    return trustedOrigin
+
+  if (origin === OPAQUE_ORIGIN && requestPath.startsWith(BYOK_API_PREFIX))
+    return origin
+
   return ''
 }
 

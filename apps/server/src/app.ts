@@ -67,6 +67,7 @@ import { createAudioSpeechWsHandlers } from './routes/audio-speech-ws'
 import { createAudioTranscriptionStreamHandler } from './routes/audio-transcription-stream/route'
 import { createAuthRoutes } from './routes/auth'
 import { createVolcengineByokSpeechRoutes } from './routes/byok/volcengine-speech'
+import { createVolcengineByokTranscriptionWsHandlers } from './routes/byok/volcengine-transcription'
 import { createCharacterRoutes } from './routes/characters'
 import { createChatWsHandlers } from './routes/chat-ws'
 import { createChatRoutes } from './routes/chats'
@@ -98,7 +99,7 @@ import { createVoicePackService } from './services/domain/voice-packs'
 import { createEnvelopeCrypto } from './utils/envelope-crypto'
 import { ApiError, createInternalError } from './utils/error'
 import { nanoid } from './utils/id'
-import { getTrustedOrigin } from './utils/origin'
+import { getTrustedCorsOrigin } from './utils/origin'
 
 interface AppDeps {
   auth: AuthInstance
@@ -144,7 +145,7 @@ export async function buildApp(deps: AppDeps) {
     .use(
       '/api/*',
       cors({
-        origin: origin => getTrustedOrigin(origin, deps.env.ADDITIONAL_TRUSTED_ORIGINS),
+        origin: (origin, c) => getTrustedCorsOrigin(origin, c.req.path, deps.env.ADDITIONAL_TRUSTED_ORIGINS),
         credentials: true,
       }),
     )
@@ -226,6 +227,14 @@ export async function buildApp(deps: AppDeps) {
     })
   }))
 
+  // Browser-safe Volcengine BYOK ASR relay. The client sends its provider key
+  // in the first WebSocket frame; binary PCM then travels over this socket and
+  // is bridged to the server-owned Volcengine WebSocket.
+  const volcengineTranscriptionWsSetup = createVolcengineByokTranscriptionWsHandlers()
+  app.get('/api/v1/byok/volcengine/audio/transcriptions/ws', upgradeWebSocket(c =>
+    volcengineTranscriptionWsSetup(c.req.query('resource_id')),
+  ))
+
   // Realtime ASR proxy. Mounted before the global bodyLimit middleware because
   // the request body is a live microphone PCM stream rather than a bounded JSON
   // payload. Auth is resolved manually here for the same reason.
@@ -237,11 +246,10 @@ export async function buildApp(deps: AppDeps) {
     providerCatalogService: deps.providerCatalogService,
   }))
 
-  // Volcengine's new-console V3 endpoint requires `X-Api-Key`, which its
-  // browser CORS preflight does not currently allow. This fixed-upstream BYOK
-  // relay receives the caller's key as Bearer auth and translates it server-
-  // side. Register it before sessionMiddleware: this Authorization header is
-  // a provider credential, not an AIRI login token.
+  // Volcengine's new-console V3 endpoint requires `X-Api-Key`. The TTS relay
+  // remains an ordinary HTTP route; its realtime ASR relay is registered above
+  // as a WebSocket because browsers cannot send a streaming HTTP request body
+  // through the HTTP/1.x server.
   app.route('/api/v1/byok/volcengine', createVolcengineByokSpeechRoutes())
 
   // Cross-instance config invalidation. The subscriber owns its own

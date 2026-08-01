@@ -119,6 +119,18 @@ pages:
         mode-options:
           streaming: 流式识别
           batch: 分段批量识别
+      tts:
+        title: 会议 TTS
+        description: 会议会话使用这里冻结的 TTS 配置，不读取全局语音页的 Provider、模型或声音。
+        use-current: 使用当前语音配置
+        provider: TTS Provider ID
+        provider-placeholder: 例如 volcengine
+        model: TTS 模型
+        model-placeholder: 例如 seed-tts-2.0
+        voice: TTS 声音 ID
+        voice-placeholder: 选择或填写火山引擎声音 ID
+        voice-name: 声音名称
+        voice-name-placeholder: 可选，用于识别配置
       vad:
         title: VAD 分段参数
         threshold: 语音阈值
@@ -161,6 +173,7 @@ pages:
       MEETING_MEDIA_SESSION_STALE: 该操作属于已经失效的会议媒体会话。
       MEETING_MEDIA_MONITOR_DEVICE_REQUIRED: 请明确选择会议声音的物理监听设备。
       MEETING_MEDIA_SPEECH_CONFIG_REQUIRED: 请完整填写 ASR Provider、模型和识别语言。
+      MEETING_MEDIA_TTS_PROVIDER_NOT_READY: 请在会议配置中选择已配置的 TTS Provider、模型和声音。
       MEETING_MEDIA_COMPATIBILITY_PLATFORM_UNSUPPORTED: 兼容桥当前要求 macOS 13 或更高版本。
       MEETING_MEDIA_OBS_NOT_INSTALLED: 系统或用户“应用程序”目录中未找到 OBS Studio。
       MEETING_MEDIA_SCREEN_AUDIO_PERMISSION_REQUIRED: 请在 macOS 系统设置中授予 AIRI“屏幕与系统音频录制”权限。

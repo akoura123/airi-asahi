@@ -99,6 +99,14 @@ export interface MeetingMediaSpeechProfile {
   vad: MeetingMediaVadProfile
 }
 
+/** Persisted speech-output choices used only while the meeting media session is active. */
+export interface MeetingMediaTtsProfile {
+  providerId: string
+  model: string
+  voiceId: string
+  voiceName: string
+}
+
 /** Persisted AIRI speech-output choices. */
 export interface MeetingMediaAgentAudioProfile {
   enabled: boolean
@@ -116,12 +124,13 @@ export interface MeetingMediaAgentAudioProfile {
  * {@link MEETING_MEDIA_PROTOCOL_VERSION} independently.
  */
 export interface MeetingMediaProfile {
-  schemaVersion: 2
+  schemaVersion: 3
   /** Explicit session implementation; no runtime fallback occurs between backends. */
   backend: MeetingMediaBackend
   video: MeetingMediaVideoProfile
   receiveAudio: MeetingMediaReceiveAudioProfile
   speech: MeetingMediaSpeechProfile
+  tts: MeetingMediaTtsProfile
   agentAudio: MeetingMediaAgentAudioProfile
   duplexPolicy: 'full-duplex' | 'half-duplex'
 }
@@ -391,6 +400,13 @@ const MeetingMediaSpeechProfileSchema = strictObject({
   vad: MeetingMediaVadProfileSchema,
 })
 
+const MeetingMediaTtsProfileSchema = strictObject({
+  providerId: string(),
+  model: string(),
+  voiceId: string(),
+  voiceName: string(),
+})
+
 const MeetingMediaAgentAudioProfileSchema = strictObject({
   enabled: boolean(),
   localMonitor: boolean(),
@@ -399,6 +415,76 @@ const MeetingMediaAgentAudioProfileSchema = strictObject({
 })
 
 export const MeetingMediaProfileSchema = pipe(
+  strictObject({
+    schemaVersion: literal(3),
+    backend: picklist(['native', 'compatibility']),
+    video: MeetingMediaVideoProfileSchema,
+    receiveAudio: MeetingMediaReceiveAudioProfileSchema,
+    speech: MeetingMediaSpeechProfileSchema,
+    tts: MeetingMediaTtsProfileSchema,
+    agentAudio: MeetingMediaAgentAudioProfileSchema,
+    duplexPolicy: picklist(['full-duplex', 'half-duplex']),
+  }),
+  check(
+    profile => profile.video.enabled || profile.receiveAudio.enabled || profile.agentAudio.enabled,
+    'At least one meeting media route must be enabled.',
+  ),
+  check(
+    profile => profile.backend !== 'compatibility' || profile.duplexPolicy === 'full-duplex',
+    'The isolated compatibility audio routes require full-duplex operation.',
+  ),
+)
+
+/** Returns a fresh default profile suitable for persistence and later explicit configuration. */
+export function createDefaultMeetingMediaProfile(): MeetingMediaProfile {
+  return {
+    schemaVersion: 3,
+    backend: 'compatibility',
+    video: {
+      enabled: true,
+      width: 1280,
+      height: 720,
+      fps: 30,
+      fit: 'contain',
+      background: { kind: 'stage' },
+      mirrorSource: false,
+    },
+    receiveAudio: {
+      enabled: true,
+      captureSourceId: '',
+      captureSourceName: '',
+      monitorDeviceId: '',
+      monitorGain: 1,
+    },
+    speech: {
+      locale: 'zh-CN',
+      providerId: 'volcengine-transcription',
+      model: 'volc.seedasr.sauc.duration',
+      mode: 'streaming',
+      vad: {
+        threshold: 0.52,
+        minSilenceDurationMs: 600,
+        speechPadMs: 360,
+        minSpeechDurationMs: 300,
+      },
+    },
+    tts: {
+      providerId: 'volcengine',
+      model: 'seed-tts-2.0',
+      voiceId: '',
+      voiceName: '',
+    },
+    agentAudio: {
+      enabled: true,
+      localMonitor: true,
+      outputDeviceId: '',
+      outputDeviceName: '',
+    },
+    duplexPolicy: 'full-duplex',
+  }
+}
+
+const MeetingMediaProfileV2Schema = pipe(
   strictObject({
     schemaVersion: literal(2),
     backend: picklist(['native', 'compatibility']),
@@ -418,46 +504,52 @@ export const MeetingMediaProfileSchema = pipe(
   ),
 )
 
-/** Returns a fresh default profile suitable for persistence and later explicit configuration. */
-export function createDefaultMeetingMediaProfile(): MeetingMediaProfile {
+/**
+ * Migrates the persisted v2 meeting profile to the v3 ASR/TTS profile shape.
+ *
+ * This is a storage migration only. Eventa and runtime boundaries accept v3
+ * profiles through {@link parseMeetingMediaProfile}; unsupported persisted
+ * values are discarded by the caller instead of entering the media session.
+ */
+export function migrateMeetingMediaProfile(profile: unknown): MeetingMediaProfile | undefined {
+  const result = safeParse(MeetingMediaProfileV2Schema, profile)
+  if (!result.success)
+    return undefined
+
+  const previous = result.output
+  const locale = previous.speech.locale.trim() || 'zh-CN'
+  const speech = previous.speech.providerId === 'alibaba-cloud-model-studio-transcription'
+    ? {
+        ...previous.speech,
+        locale,
+        providerId: 'volcengine-transcription',
+        model: 'volc.seedasr.sauc.duration',
+        mode: 'streaming' as const,
+        vad: {
+          ...previous.speech.vad,
+          minSilenceDurationMs: previous.speech.vad.minSilenceDurationMs === 1200
+            ? 600
+            : previous.speech.vad.minSilenceDurationMs,
+        },
+      }
+    : {
+        ...previous.speech,
+        locale,
+        vad: {
+          ...previous.speech.vad,
+          // v2's 1200 ms value was the shipped default. Lower only that
+          // untouched default; preserve an explicitly tuned user value.
+          minSilenceDurationMs: previous.speech.vad.minSilenceDurationMs === 1200
+            ? 600
+            : previous.speech.vad.minSilenceDurationMs,
+        },
+      }
+
   return {
-    schemaVersion: 2,
-    backend: 'compatibility',
-    video: {
-      enabled: true,
-      width: 1280,
-      height: 720,
-      fps: 30,
-      fit: 'contain',
-      background: { kind: 'stage' },
-      mirrorSource: false,
-    },
-    receiveAudio: {
-      enabled: true,
-      captureSourceId: '',
-      captureSourceName: '',
-      monitorDeviceId: '',
-      monitorGain: 1,
-    },
-    speech: {
-      locale: '',
-      providerId: '',
-      model: '',
-      mode: 'streaming',
-      vad: {
-        threshold: 0.52,
-        minSilenceDurationMs: 1200,
-        speechPadMs: 360,
-        minSpeechDurationMs: 300,
-      },
-    },
-    agentAudio: {
-      enabled: true,
-      localMonitor: true,
-      outputDeviceId: '',
-      outputDeviceName: '',
-    },
-    duplexPolicy: 'full-duplex',
+    ...previous,
+    schemaVersion: 3,
+    speech,
+    tts: createDefaultMeetingMediaProfile().tts,
   }
 }
 

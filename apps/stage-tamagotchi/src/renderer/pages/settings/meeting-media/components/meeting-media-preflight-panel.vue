@@ -15,6 +15,7 @@ import { useI18n } from 'vue-i18n'
 
 const props = defineProps<{
   backend: 'native' | 'compatibility'
+  receiveAudioEnabled: boolean
   preflight: DeepReadonly<MeetingMediaPreflight> | null
   browserDevices: MeetingMediaBrowserDevices
   browserDeviceError: string | null
@@ -24,6 +25,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   check: []
+  requestScreenCapturePermission: []
   refreshDevices: []
 }>()
 
@@ -33,6 +35,13 @@ const routeChecks = computed(() => MEETING_MEDIA_ROUTES.map(route => ({
   route,
   result: props.preflight?.routes[route] ?? null,
 })))
+
+const needsScreenCapturePermission = computed(() => {
+  return window.platform === 'darwin'
+    && props.backend === 'compatibility'
+    && props.receiveAudioEnabled
+    && props.preflight?.routes['remote-audio-in']?.permission !== 'granted'
+})
 
 const browserDeviceChecks = computed(() => {
   if (props.backend === 'compatibility') {
@@ -121,16 +130,27 @@ function browserErrorLabel(code: string): string {
           {{ t('tamagotchi.settings.pages.meeting-media.preflight.description') }}
         </p>
       </div>
-      <Button
-        variant="primary"
-        size="sm"
-        icon="i-solar:shield-check-bold-duotone"
-        :loading="commandPending"
-        :disabled="commandPending"
-        @click="emit('check')"
-      >
-        {{ t('tamagotchi.settings.pages.meeting-media.actions.check') }}
-      </Button>
+      <div :class="['flex flex-wrap items-center gap-2']">
+        <Button
+          v-if="needsScreenCapturePermission"
+          variant="secondary"
+          size="sm"
+          icon="i-solar:settings-minimalistic-bold-duotone"
+          @click="emit('requestScreenCapturePermission')"
+        >
+          {{ t('tamagotchi.settings.screen-capture.permissions-prompt.open-preferences') }}
+        </Button>
+        <Button
+          variant="primary"
+          size="sm"
+          icon="i-solar:shield-check-bold-duotone"
+          :loading="commandPending"
+          :disabled="commandPending"
+          @click="emit('check')"
+        >
+          {{ t('tamagotchi.settings.pages.meeting-media.actions.check') }}
+        </Button>
+      </div>
     </header>
 
     <div :class="['grid grid-cols-1 gap-3 lg:grid-cols-3']">

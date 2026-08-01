@@ -3,7 +3,7 @@ import type { TranscriptionProviderWithExtraOptions } from '@xsai-ext/providers/
 import type { WithUnknown } from '@xsai/shared'
 import type { StreamTranscriptionResult, StreamTranscriptionOptions as XSAIStreamTranscriptionOptions } from '@xsai/stream-transcription'
 
-import { errorMessageFrom, tryCatch } from '@moeru/std'
+import { errorMessageFrom } from '@moeru/std'
 import { errorMessageFromValue, IOAttributes, IOEvents, IOSpanNames, IOSubsystems } from '@proj-airi/stage-shared'
 import { useLocalStorageManualReset } from '@proj-airi/stage-shared/composables'
 import { refManualReset } from '@vueuse/core'
@@ -18,6 +18,7 @@ import { activeTurnSpan, startSpan } from '../../composables/use-io-tracer'
 import { OFFICIAL_TRANSCRIPTION_PROVIDER_ID } from '../../libs/providers'
 import { useProvidersStore } from '../providers'
 import { streamAliyunTranscription } from '../providers/aliyun/stream-transcription'
+import { streamVolcengineTranscription } from '../providers/volcengine/stream-transcription'
 import { streamWebSpeechAPITranscription } from '../providers/web-speech-api'
 
 function errorMessage(err: unknown): string {
@@ -141,6 +142,9 @@ export interface MediaStreamTranscriptionOptions {
   onSpeechEnd?: (text: string) => void
 }
 
+/** Per-request controls for a caller-finished 16 kHz mono Float32 PCM segment. */
+export type PcmTranscriptionOptions = Omit<MediaStreamTranscriptionOptions, 'sampleRate' | 'idleTimeoutMs'>
+
 /**
  * Owns one streaming transcription request independently from later requests.
  * Calling `finish` closes or aborts only this request and always returns the same completion.
@@ -148,6 +152,12 @@ export interface MediaStreamTranscriptionOptions {
 export interface HearingStreamingTranscriptionSession {
   /** Closes the PCM input gracefully, or aborts the transport when `abort` is true. */
   finish: (abort?: boolean) => Promise<string | undefined>
+}
+
+/** Owns one provider stream whose input is canonical 16 kHz mono Float32 PCM. */
+export interface HearingPcmTranscriptionSession extends HearingStreamingTranscriptionSession {
+  /** Writes one or more finite PCM samples before the session is finished. */
+  push: (samples: Float32Array) => void
 }
 
 export const CONFIDENCE_THRESHOLD_DISABLED = -3
@@ -271,6 +281,7 @@ export function resolveTranscriptionFileName(file: File, explicitFileName?: stri
 const STREAM_TRANSCRIPTION_EXECUTORS: Record<string, StreamTranscription> = {
   'aliyun-nls-transcription': streamAliyunTranscription,
   [OFFICIAL_TRANSCRIPTION_PROVIDER_ID]: streamAliyunTranscription,
+  'volcengine-transcription': streamVolcengineTranscription,
   // Web Speech API is handled specially in transcribeForMediaStream since it works directly with MediaStream
 }
 
@@ -614,11 +625,18 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     ended: boolean
   }
 
+  interface StreamingAudioInput {
+    audioStream: ReadableStream<Uint8Array>
+    close: (reason?: DOMException) => void
+    dispose: () => Promise<void>
+  }
+
+  interface WritablePcmAudioInput extends StreamingAudioInput {
+    push: (samples: Float32Array) => void
+  }
+
   interface ActiveStreamingTranscriptionSession {
-    audioContext: AudioContext | Record<string, never>
-    workletNode: AudioWorkletNode | Record<string, never>
-    mediaStreamSource: MediaStreamAudioSourceNode | Record<string, never>
-    audioStreamController?: ReadableStreamDefaultController<Uint8Array>
+    audioInput?: StreamingAudioInput
     abortController: AbortController
     result?: HearingTranscriptionResult & { recognition?: any }
     idleTimer?: ReturnType<typeof setTimeout>
@@ -695,6 +713,8 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
   function float32ToInt16(buffer: Float32Array) {
     const output = new Int16Array(buffer.length)
     for (let i = 0; i < buffer.length; i++) {
+      if (!Number.isFinite(buffer[i]))
+        throw new TypeError('Streaming transcription PCM samples must be finite.')
       const value = Math.max(-1, Math.min(1, buffer[i]))
       output[i] = value < 0 ? value * 0x8000 : value * 0x7FFF
     }
@@ -702,30 +722,57 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     return output
   }
 
-  async function createAudioStreamFromMediaStream(stream: MediaStream, sampleRate = DEFAULT_SAMPLE_RATE, onActivity?: () => void) {
-    const audioContext = new AudioContext({ sampleRate, latencyHint: 'interactive' })
-    await audioContext.audioWorklet.addModule(vadWorkletUrl)
-    const workletNode = new AudioWorkletNode(audioContext, 'vad-audio-worklet-processor')
-
-    let audioStreamController: ReadableStreamDefaultController<Uint8Array> | undefined
+  function createAudioStreamController() {
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined
+    let closed = false
     const audioStream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        audioStreamController = controller
+      start(streamController) {
+        controller = streamController
       },
       cancel: () => {
-        audioStreamController = undefined
+        closed = true
+        controller = undefined
       },
     })
 
+    return {
+      audioStream,
+      enqueue(chunk: Uint8Array) {
+        if (closed || !controller)
+          throw new Error('The streaming transcription PCM input is closed.')
+        controller.enqueue(chunk)
+      },
+      close(reason?: DOMException) {
+        if (closed)
+          return
+        closed = true
+        const ownedController = controller
+        controller = undefined
+        if (!ownedController)
+          return
+        if (reason)
+          ownedController.error(reason)
+        else
+          ownedController.close()
+      },
+    }
+  }
+
+  async function createAudioStreamFromMediaStream(stream: MediaStream, sampleRate = DEFAULT_SAMPLE_RATE, onActivity?: () => void): Promise<StreamingAudioInput> {
+    const audioContext = new AudioContext({ sampleRate, latencyHint: 'interactive' })
+    await audioContext.audioWorklet.addModule(vadWorkletUrl)
+    const workletNode = new AudioWorkletNode(audioContext, 'vad-audio-worklet-processor')
+    const audioInput = createAudioStreamController()
+
     workletNode.port.onmessage = ({ data }: MessageEvent<{ buffer?: Float32Array }>) => {
       const buffer = data?.buffer
-      if (!buffer || !audioStreamController)
+      if (!buffer)
         return
 
       const pcm16 = float32ToInt16(buffer)
       // Fetch request streams accept byte chunks. Clone the worklet-owned PCM
       // buffer so Chromium can consume it after this message handler returns.
-      audioStreamController.enqueue(
+      audioInput.enqueue(
         new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength).slice(),
       )
       onActivity?.()
@@ -740,13 +787,37 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     workletNode.connect(silentGain)
     silentGain.connect(audioContext.destination)
 
+    if (audioContext.state === 'suspended')
+      await audioContext.resume()
+
     return {
-      audioContext,
-      workletNode,
-      mediaStreamSource,
-      audioStream,
-      get controller() {
-        return audioStreamController
+      audioStream: audioInput.audioStream,
+      close: reason => audioInput.close(reason),
+      async dispose() {
+        mediaStreamSource.disconnect()
+        workletNode.port.onmessage = null
+        workletNode.disconnect()
+        silentGain.disconnect()
+        if (audioContext.state !== 'closed')
+          await audioContext.close()
+      },
+    }
+  }
+
+  function createAudioStreamFromPcm(): WritablePcmAudioInput {
+    const audioInput = createAudioStreamController()
+    return {
+      audioStream: audioInput.audioStream,
+      close: reason => audioInput.close(reason),
+      dispose: () => Promise.resolve(),
+      push(samples) {
+        if (!(samples instanceof Float32Array) || samples.length === 0)
+          throw new TypeError('Streaming transcription PCM must contain Float32 samples.')
+
+        const pcm16 = float32ToInt16(samples)
+        audioInput.enqueue(
+          new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength),
+        )
       },
     }
   }
@@ -775,7 +846,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     if (streamingSession.value === session)
       streamingSession.value = undefined
 
-    let closeAudioContext = Promise.resolve()
+    let disposeAudioInput = Promise.resolve()
     try {
       if (session.providerId === 'browser-web-speech-api') {
         if (abort && !session.abortController.signal.aborted) {
@@ -793,17 +864,8 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
         // Closing PCM is the protocol-level end-of-segment signal. Aborting instead
         // cancels the transport and intentionally discards its final transcript.
-        if (abort)
-          session.audioStreamController?.error(reason)
-        else
-          session.audioStreamController?.close()
-
-        session.mediaStreamSource.disconnect()
-        session.workletNode.port.onmessage = null
-        session.workletNode.disconnect()
-        closeAudioContext = (async () => {
-          await tryCatch(() => session.audioContext.close())
-        })()
+        session.audioInput?.close(abort ? reason : undefined)
+        disposeAudioInput = session.audioInput?.dispose() ?? Promise.resolve()
       }
     }
     catch (err) {
@@ -812,7 +874,13 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     }
 
     session.completion = (async () => {
-      await closeAudioContext
+      try {
+        await disposeAudioInput
+      }
+      catch (err) {
+        if (!isExpectedStreamStopError(err))
+          console.error('Error disposing streaming transcription audio input:', err)
+      }
 
       try {
         const text = session.result?.mode === 'stream'
@@ -866,13 +934,16 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
   }
 
   async function startStreamingTranscriptionSession(
-    stream: MediaStream,
+    stream: MediaStream | undefined,
     options?: MediaStreamTranscriptionOptions,
+    providedAudioInput?: StreamingAudioInput,
+    allowSessionReuse = true,
   ): Promise<HearingStreamingTranscriptionSession | undefined> {
     const request = resolveTranscriptionRequest(options?.selection)
-    console.info('[Hearing Pipeline] transcribeForMediaStream called', {
+    console.info('[Hearing Pipeline] startStreamingTranscriptionSession called', {
       supportsStreamInput: providerSupportsStreamInput(request.providerId),
       hasStream: !!stream,
+      hasPcmInput: !!providedAudioInput,
       providerId: request.providerId,
       hasCallbacks: !!(options?.onSentenceEnd || options?.onSpeechEnd),
     })
@@ -884,6 +955,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
     error.value = undefined
     let startupTrace: StreamingAsrTrace | undefined
+    let startupAudioInput: StreamingAudioInput | undefined
 
     try {
       const { model, providerConfig, providerId } = request
@@ -898,6 +970,8 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
       // Special handling for Web Speech API - it works directly with MediaStream
       if (providerId === 'browser-web-speech-api') {
+        if (!stream || providedAudioInput)
+          throw new Error('Web Speech API requires a browser MediaStream and cannot consume caller-supplied PCM.')
         trackVoiceInputStarted({ stt_provider_id: providerId })
 
         // Check if Web Speech API is available
@@ -990,10 +1064,6 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
         // Store session info for cleanup
         const activeSession: ActiveStreamingTranscriptionSession = {
-          audioContext: {} as AudioContext, // Not used for Web Speech API
-          workletNode: {} as AudioWorkletNode, // Not used for Web Speech API
-          mediaStreamSource: {} as MediaStreamAudioSourceNode, // Not used for Web Speech API
-          audioStreamController: undefined,
           abortController,
           result: { ...result, mode: 'stream' as const, recognition: result.recognition },
           providerId,
@@ -1054,7 +1124,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
           onSpeechEnd: options?.onSpeechEnd,
         })
 
-        if (hasNewCallbacks) {
+        if (!allowSessionReuse || hasNewCallbacks) {
           console.info('[Hearing Pipeline] New callbacks provided, restarting session')
           // Detaching is synchronous; the prior provider response may finish in parallel.
           void finishStreamingSession(existingSession, false)
@@ -1075,20 +1145,20 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
           resetStreamingIdleTimer(ownedSession, idleTimeout)
       }
 
-      const audioSession = await createAudioStreamFromMediaStream(
-        stream,
+      if (!providedAudioInput && !stream)
+        throw new Error('Streaming transcription requires a MediaStream or caller-supplied PCM input.')
+      const audioInput = providedAudioInput ?? await createAudioStreamFromMediaStream(
+        stream!,
         options?.sampleRate ?? DEFAULT_SAMPLE_RATE,
         () => bumpIdle(),
       )
-
-      if (audioSession.audioContext.state === 'suspended')
-        await audioSession.audioContext.resume()
+      startupAudioInput = audioInput
 
       const result = await hearingStore.transcription(
         providerId,
         provider,
         model,
-        { inputAudioStream: audioSession.audioStream },
+        { inputAudioStream: audioInput.audioStream },
         undefined,
         {
           providerOptions: {
@@ -1099,10 +1169,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
       )
 
       const activeSession: ActiveStreamingTranscriptionSession = {
-        audioContext: audioSession.audioContext,
-        workletNode: audioSession.workletNode,
-        mediaStreamSource: audioSession.mediaStreamSource,
-        audioStreamController: audioSession.controller,
+        audioInput,
         abortController,
         result,
         providerId,
@@ -1115,6 +1182,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
       ownedSession = activeSession
       streamingSession.value = activeSession
       startupTrace = undefined
+      startupAudioInput = undefined
       bumpIdle()
 
       // Stream out text deltas to caller without tearing down the session.
@@ -1150,6 +1218,10 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
       return handleForStreamingSession(activeSession)
     }
     catch (err) {
+      if (startupAudioInput) {
+        startupAudioInput.close(new DOMException('Aborted', 'AbortError'))
+        await startupAudioInput.dispose().catch(() => undefined)
+      }
       if (startupTrace)
         endStreamingAsrTrace(startupTrace)
 
@@ -1165,6 +1237,10 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     stream: MediaStream,
     options?: MediaStreamTranscriptionOptions,
   ): Promise<HearingStreamingTranscriptionSession | undefined> {
+    return serializeStreamingStartup(() => startStreamingTranscriptionSession(stream, options))
+  }
+
+  async function serializeStreamingStartup<T>(start: () => Promise<T>): Promise<T> {
     const previousStartup = streamingStartupTail
     let releaseStartup: () => void = () => undefined
     streamingStartupTail = new Promise<void>((resolve) => {
@@ -1173,10 +1249,32 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
     await previousStartup
     try {
-      return await startStreamingTranscriptionSession(stream, options)
+      return await start()
     }
     finally {
       releaseStartup()
+    }
+  }
+
+  async function transcribeForPcmStream(
+    options?: PcmTranscriptionOptions,
+  ): Promise<HearingPcmTranscriptionSession | undefined> {
+    const audioInput = createAudioStreamFromPcm()
+    const session = await serializeStreamingStartup(() => startStreamingTranscriptionSession(
+      undefined,
+      { ...options, idleTimeoutMs: 0 },
+      audioInput,
+      false,
+    ))
+    if (!session) {
+      audioInput.close(new DOMException('Aborted', 'AbortError'))
+      await audioInput.dispose().catch(() => undefined)
+      return
+    }
+
+    return {
+      push: samples => audioInput.push(samples),
+      finish: session.finish,
     }
   }
 
@@ -1255,6 +1353,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
     transcribeForRecording,
     transcribeForMediaStream,
+    transcribeForPcmStream,
     stopStreamingTranscription,
     supportsStreamInput,
   }

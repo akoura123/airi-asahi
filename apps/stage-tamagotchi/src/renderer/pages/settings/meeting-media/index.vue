@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import type { MeetingMediaProfile } from '@proj-airi/stage-shared/meeting-media'
+import type { MeetingMediaProfile, MeetingMediaTtsProfile } from '@proj-airi/stage-shared/meeting-media'
 
 import { matchesMeetingMediaDeviceName, MEETING_MEDIA_COMPATIBILITY_NAMES } from '@proj-airi/stage-shared/meeting-media'
 import { resolveActiveTranscriptionModel, resolveTranscriptionProviderOptions, useHearingStore } from '@proj-airi/stage-ui/stores/modules/hearing'
 import { useMeetingMediaStore } from '@proj-airi/stage-ui/stores/modules/meeting-media'
+import { useSpeechStore } from '@proj-airi/stage-ui/stores/modules/speech'
 import { useProvidersStore } from '@proj-airi/stage-ui/stores/providers'
 import { Callout } from '@proj-airi/ui'
 import { storeToRefs } from 'pinia'
-import { computed, shallowRef } from 'vue'
+import { computed, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import MeetingMediaPreflightPanel from './components/meeting-media-preflight-panel.vue'
@@ -18,6 +19,7 @@ import { useMeetingMediaDevices } from '../../../composables/use-meeting-media-d
 
 const meetingMediaStore = useMeetingMediaStore()
 const hearingStore = useHearingStore()
+const speechStore = useSpeechStore()
 const providersStore = useProvidersStore()
 const {
   bridgeError,
@@ -30,6 +32,7 @@ const {
   runtime,
 } = storeToRefs(meetingMediaStore)
 const { activeTranscriptionModel, activeTranscriptionProvider } = storeToRefs(hearingStore)
+const { activeSpeechModel, activeSpeechProvider, activeSpeechVoice } = storeToRefs(speechStore)
 const {
   inventory,
   captureSources,
@@ -38,6 +41,7 @@ const {
   authorizingVideoInput,
   authorizingAudioOutput,
   refresh: refreshDevices,
+  requestScreenCapturePermission,
   authorizeVideoInput,
   authorizeAudioOutput,
 } = useMeetingMediaDevices()
@@ -58,6 +62,34 @@ const activeSpeechProfile = computed(() => {
     locale: providerOptions.language ?? navigator.language,
   }
 })
+const activeTtsProfile = computed<MeetingMediaTtsProfile>(() => {
+  const providerId = activeSpeechProvider.value
+  const providerConfig = providersStore.getProviderConfig(providerId)
+  const voiceId = activeSpeechVoice.value?.id
+    ?? (typeof providerConfig?.voice === 'string' ? providerConfig.voice : '')
+  const voiceName = activeSpeechVoice.value?.name ?? voiceId
+  const model = activeSpeechModel.value
+    || (typeof providerConfig?.model === 'string' ? providerConfig.model : '')
+  return {
+    providerId,
+    model,
+    voiceId,
+    voiceName,
+  }
+})
+const meetingTtsVoices = computed(() => speechStore.getVoicesForProvider(profile.value.tts.providerId))
+
+watch(
+  [
+    () => profile.value.tts.providerId,
+    () => profile.value.tts.model,
+  ],
+  ([providerId, model]) => {
+    if (providerId)
+      void speechStore.loadVoicesForProvider(providerId, model || undefined)
+  },
+  { immediate: true },
+)
 
 function updateProfile(nextProfile: MeetingMediaProfile): void {
   try {
@@ -155,12 +187,14 @@ async function stop(): Promise<void> {
 
     <MeetingMediaPreflightPanel
       :backend="profile.backend"
+      :receive-audio-enabled="profile.receiveAudio.enabled"
       :preflight="preflightResult"
       :browser-devices="inventory"
       :browser-device-error="browserDeviceError"
       :device-refreshing="deviceRefreshing"
       :command-pending="commandPending"
       @check="runPreflight"
+      @request-screen-capture-permission="requestScreenCapturePermission"
       @refresh-devices="refreshDevices"
     />
 
@@ -171,6 +205,8 @@ async function stop(): Promise<void> {
       :capture-sources="captureSources"
       :device-labels-available="inventory.labelsAvailable"
       :active-speech-profile="activeSpeechProfile"
+      :active-tts-profile="activeTtsProfile"
+      :tts-voices="meetingTtsVoices"
       :authorizing-video-input="authorizingVideoInput"
       :authorizing-agent-output="authorizingAudioOutput"
       @update:profile="updateProfile"

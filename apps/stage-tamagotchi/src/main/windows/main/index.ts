@@ -34,7 +34,7 @@ import { electronStartDraggingWindow } from '../../../shared/eventa'
 import { onAppBeforeQuit } from '../../libs/bootkit/lifecycle'
 import { baseUrl, getElectronMainDirname, load } from '../../libs/electron/location'
 import { createConfig } from '../../libs/electron/persistence'
-import { protectPrivilegedWindowNavigation, transparentWindowConfig } from '../shared'
+import { protectPrivilegedWindowNavigation, STAGE_WINDOW_MIN_SIZE, transparentWindowConfig } from '../shared'
 import { setupMainWindowElectronInvokes } from './rpc/index.electron'
 
 const appConfigSchema = object({
@@ -78,11 +78,15 @@ export async function setupMainWindow(params: {
   setupConfig()
 
   const mainWindowConfig = getConfig().windows?.find(w => w.title === 'AIRI' && w.tag === 'main')
+  const initialWidth = Math.max(mainWindowConfig?.width ?? 450.0, STAGE_WINDOW_MIN_SIZE.width)
+  const initialHeight = Math.max(mainWindowConfig?.height ?? 600.0, STAGE_WINDOW_MIN_SIZE.height)
 
   const window = new BrowserWindow({
     title: 'AIRI',
-    width: mainWindowConfig?.width ?? 450.0,
-    height: mainWindowConfig?.height ?? 600.0,
+    width: initialWidth,
+    height: initialHeight,
+    minWidth: STAGE_WINDOW_MIN_SIZE.width,
+    minHeight: STAGE_WINDOW_MIN_SIZE.height,
     x: mainWindowConfig?.x,
     y: mainWindowConfig?.y,
     show: false,

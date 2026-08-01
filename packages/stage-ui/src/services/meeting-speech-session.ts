@@ -1,10 +1,11 @@
 import type {
+  MeetingMediaPcmFrame,
   MeetingMediaSpeechEvent,
   MeetingMediaSpeechProfile,
   MeetingMediaTranscriptEvent,
 } from '@proj-airi/stage-shared/meeting-media'
 
-import type { HearingStreamingTranscriptionSession } from '../stores/modules/hearing'
+import type { HearingPcmTranscriptionSession } from '../stores/modules/hearing'
 
 import { toWav } from '@proj-airi/audio/encoding'
 import { joinTranscriptFragments } from '@proj-airi/pipelines-audio'
@@ -17,17 +18,18 @@ import { useHearingSpeechInputPipeline } from '../stores/modules/hearing'
 import { useProvidersStore } from '../stores/providers'
 import { MeetingTurnAssembler } from './meeting-speech'
 
+const MEETING_PCM_FRAME_DURATION_MS = 32
+
 interface ActiveMeetingSpeechSegment {
   id: string
   capturedAtMs: number
   partialText: string
-  streamingSession: Promise<HearingStreamingTranscriptionSession> | null
+  streamingSession: Promise<HearingPcmTranscriptionSession> | null
   batchAbortController?: AbortController
 }
 
 interface ActiveMeetingSpeechSession {
   sessionId: string
-  stream: MediaStream
   profile: MeetingMediaSpeechProfile
   assembler: MeetingTurnAssembler
   capturingSegment: ActiveMeetingSpeechSegment | null
@@ -37,12 +39,18 @@ interface ActiveMeetingSpeechSession {
   transcriptSequence: number
   generation: number
   failed: boolean
+  processingFrame: MeetingMediaPcmFrame | null
+  processingTail: Promise<void>
+  bufferedFrames: number
+  preSpeechFrames: MeetingMediaPcmFrame[]
 }
 
 export interface MeetingSpeechSessionOptions {
   onPartial?: (event: Extract<MeetingMediaTranscriptEvent, { type: 'partial' }>) => void
   onTurnEnd: (event: Extract<MeetingMediaTranscriptEvent, { type: 'turn-end' }>) => void | Promise<void>
   onFailure: (error: Error) => void
+  onVadInference?: (durationMs: number) => void
+  onBufferedFrames?: (frames: number) => void
 }
 
 function normalizedError(error: unknown): Error {
@@ -149,7 +157,9 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
 
     const segment: ActiveMeetingSpeechSegment = {
       id: crypto.randomUUID(),
-      capturedAtMs: Date.now(),
+      capturedAtMs: session.preSpeechFrames[0]?.capturedAtMs
+        ?? session.processingFrame?.capturedAtMs
+        ?? Date.now(),
       partialText: '',
       streamingSession: null,
     }
@@ -167,12 +177,11 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
     if (session.profile.mode !== 'streaming')
       return
 
-    segment.streamingSession = hearingPipeline.transcribeForMediaStream(session.stream, {
+    segment.streamingSession = hearingPipeline.transcribeForPcmStream({
       selection: {
         providerId: session.profile.providerId,
         model: session.profile.model,
       },
-      idleTimeoutMs: 0,
       providerOptions: { language: session.profile.locale },
       onSentenceEnd: delta => acceptPartial(session, segment, delta),
     }).then((streamingSession) => {
@@ -308,9 +317,96 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
     onSpeechReady: event => transcribeBatch(event.buffer),
   })
 
+  function enqueueSegmentFrame(
+    session: ActiveMeetingSpeechSession,
+    segment: ActiveMeetingSpeechSegment,
+    frame: MeetingMediaPcmFrame,
+  ): void {
+    const outcome = session.assembler.acceptSpeech({
+      type: 'speech-frame',
+      sessionId: session.sessionId,
+      segmentId: segment.id,
+      sequence: ++session.speechSequence,
+      capturedAtMs: frame.capturedAtMs,
+      samples: frame.samples,
+      sampleRate: 16000,
+    })
+    deliverOutcome(outcome)
+
+    if (session.profile.mode !== 'streaming' || !segment.streamingSession)
+      return
+
+    // Every handler is registered on the same startup promise, preserving PCM order even when
+    // provider initialization overlaps the first frames of a speech segment.
+    void segment.streamingSession
+      .then(streamingSession => streamingSession.push(frame.samples))
+      .catch(reportFailure)
+  }
+
+  async function processFrame(session: ActiveMeetingSpeechSession, frame: MeetingMediaPcmFrame): Promise<void> {
+    if (active?.generation !== session.generation || session.failed)
+      return
+
+    session.processingFrame = frame
+    const segmentBeforeInference = session.capturingSegment
+    if (segmentBeforeInference) {
+      enqueueSegmentFrame(session, segmentBeforeInference, frame)
+    }
+    else {
+      session.preSpeechFrames.push(frame)
+      const maxPreSpeechFrames = Math.max(1, Math.ceil(session.profile.vad.speechPadMs / MEETING_PCM_FRAME_DURATION_MS))
+      if (session.preSpeechFrames.length > maxPreSpeechFrames)
+        session.preSpeechFrames.shift()
+    }
+
+    const inferenceStartedAt = performance.now()
+    try {
+      await vad.processAudio(frame.samples)
+    }
+    finally {
+      options.onVadInference?.(performance.now() - inferenceStartedAt)
+      session.processingFrame = null
+    }
+
+    if (active?.generation !== session.generation || session.failed)
+      return
+
+    // The frame that crosses the VAD start threshold belongs to the new segment. Frames for an
+    // already-active segment were queued before inference so a speech-end callback cannot close
+    // the provider input ahead of its final silence frame.
+    const segmentAfterInference = session.capturingSegment
+    if (!segmentBeforeInference && segmentAfterInference) {
+      for (const bufferedFrame of session.preSpeechFrames)
+        enqueueSegmentFrame(session, segmentAfterInference, bufferedFrame)
+      session.preSpeechFrames.length = 0
+    }
+  }
+
+  function push(frame: MeetingMediaPcmFrame): void {
+    const session = active
+    if (!session || session.sessionId !== frame.sessionId)
+      return
+    if (frame.sampleRate !== 16000
+      || frame.channelCount !== 1
+      || !(frame.samples instanceof Float32Array)
+      || frame.samples.length !== 512) {
+      reportFailure(new Error('Meeting speech input requires canonical 16 kHz mono 512-sample PCM frames.'))
+      return
+    }
+
+    session.bufferedFrames += 1
+    options.onBufferedFrames?.(session.bufferedFrames)
+    session.processingTail = session.processingTail
+      .then(() => processFrame(session, frame))
+      .catch(reportFailure)
+      .finally(() => {
+        session.bufferedFrames = Math.max(0, session.bufferedFrames - 1)
+        options.onBufferedFrames?.(session.bufferedFrames)
+      })
+  }
+
   async function start(params: {
     sessionId: string
-    stream: MediaStream
     profile: MeetingMediaSpeechProfile
   }): Promise<void> {
     if (active)
@@ -322,10 +418,13 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
     vadSpeechPadMs.value = params.profile.vad.speechPadMs
     vadMinSpeechDurationMs.value = params.profile.vad.minSpeechDurationMs
 
+    await vad.init()
+    if (!vad.loaded.value)
+      throw new Error(vad.inferenceError.value || 'The meeting VAD model could not be initialized.')
+
     const sessionGeneration = ++generation
     active = {
       sessionId: params.sessionId,
-      stream: params.stream,
       profile: structuredClone(params.profile),
       assembler: new MeetingTurnAssembler({
         sessionId: params.sessionId,
@@ -339,12 +438,11 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
       transcriptSequence: 0,
       generation: sessionGeneration,
       failed: false,
+      processingFrame: null,
+      processingTail: Promise.resolve(),
+      bufferedFrames: 0,
+      preSpeechFrames: [],
     }
-
-    await vad.init()
-    if (!vad.loaded.value)
-      throw new Error(vad.inferenceError.value || 'The meeting VAD model could not be initialized.')
-    await vad.start(params.stream)
   }
 
   async function stop(sessionId: string): Promise<void> {
@@ -355,6 +453,7 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
     generation += 1
     active = null
     session.assembler.stop()
+    await session.processingTail
     vad.dispose()
 
     const abortReason = new DOMException('Aborted', 'AbortError')
@@ -374,5 +473,5 @@ export function useMeetingSpeechSession(options: MeetingSpeechSessionOptions) {
     finalization = Promise.resolve()
   }
 
-  return { preflight, start, stop }
+  return { preflight, start, push, stop }
 }

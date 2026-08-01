@@ -96,6 +96,14 @@ export function useMeetingMediaDevices() {
     }
   }
 
+  /** Opens the macOS Screen and System Audio Recording settings page. */
+  async function requestScreenCapturePermission(): Promise<void> {
+    if (window.platform !== 'darwin')
+      return
+
+    await screenCapture.requestMacOSPermission()
+  }
+
   function handleDeviceChange(): void {
     void refresh()
   }
@@ -250,6 +258,7 @@ export function useMeetingMediaDevices() {
     authorizingVideoInput: readonly(authorizingVideoInput),
     authorizingAudioOutput: readonly(authorizingAudioOutput),
     refresh,
+    requestScreenCapturePermission,
     authorizeVideoInput,
     authorizeAudioOutput,
   }

@@ -69,7 +69,7 @@ export function useVAD(workerUrl: string, options?: UseVADOptions) {
   const minSpeechDurationMs = toRef(options.minSpeechDurationMs)
 
   async function init() {
-    if (loaded.value || loading.value || manager.value)
+    if (loaded.value || loading.value)
       return
 
     loading.value = true
@@ -121,19 +121,6 @@ export function useVAD(workerUrl: string, options?: UseVADOptions) {
         }
       })
 
-      // Create and initialize audio manager
-      const m = createVADStates(vad.value, workerUrl, {
-        minChunkSize: 512,
-        // NOTICE: VAD will have it's own audio context since
-        // it needs special sample rate and latency settings
-        audioContextOptions: {
-          sampleRate: 16000,
-          latencyHint: 'interactive',
-        },
-      })
-
-      await m.initialize()
-      manager.value = m
       loaded.value = true
     }
     catch (error) {
@@ -145,14 +132,38 @@ export function useVAD(workerUrl: string, options?: UseVADOptions) {
   }
 
   async function start(stream: MediaStream) {
-    if (manager.value)
-      await manager.value.start(stream)
+    if (!vad.value || !loaded.value)
+      throw new Error('VAD model is not initialized. Call init() first.')
+
+    if (!manager.value) {
+      // MediaStream callers need an AudioWorklet to produce exact model frames. Canonical PCM
+      // callers bypass this graph and invoke processAudio directly.
+      const audioManager = createVADStates(vad.value, workerUrl, {
+        minChunkSize: 512,
+        audioContextOptions: {
+          sampleRate: 16000,
+          latencyHint: 'interactive',
+        },
+      })
+      await audioManager.initialize()
+      manager.value = audioManager
+    }
+
+    await manager.value.start(stream)
+  }
+
+  /** Processes caller-owned canonical 16 kHz mono PCM without an intermediate AudioContext. */
+  async function processAudio(samples: Float32Array) {
+    if (!vad.value || !loaded.value)
+      throw new Error('VAD model is not initialized. Call init() first.')
+    await vad.value.processAudio(samples)
   }
 
   function dispose() {
     manager.value?.stop()
     manager.value?.dispose()
     manager.value = undefined
+    vad.value = undefined
 
     isSpeech.value = false
     isSpeechProb.value = 0
@@ -200,6 +211,7 @@ export function useVAD(workerUrl: string, options?: UseVADOptions) {
 
     init,
     start,
+    processAudio,
     dispose,
   }
 }

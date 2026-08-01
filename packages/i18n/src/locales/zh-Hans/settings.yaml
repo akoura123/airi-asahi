@@ -1345,6 +1345,9 @@ pages:
       volcengine:
         description: 火山引擎 Seed-TTS 2.0（V3）
         title: 火山引擎
+      volcengine-transcription:
+        description: 火山引擎 BigModel 实时语音识别
+        title: 火山引擎实时 ASR
       volcengine-coding-plan:
         description: 火山引擎 Coding Plan
         title: 火山引擎 Coding Plan
